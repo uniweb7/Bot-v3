@@ -1,1 +1,1136 @@
+cat << 'EOF' > bot_attack.py
+import time
+import traceback
+import bot_tools
+from bot_tools import (
+    RestartLoopException,
+    BotPausedResumeHomeException,
+    FAST_ATTACK,
+    tap,
+    fast_serial_taps,
+    batch_tap_sequence,
+    get_screenshot,
+    smart_sleep,
+    human_sleep,
+    check_pause_point,
+    check_wrong_buttons_a14,
+    check_clan_chat_drawer_a14,
+    is_on_home_page_a14,
+    check_wrong_and_home_page_a14,
+    ensure_return_to_home_page_a14,
+    click_gold_storage_3_times,
+    zoom_out_village_a14,
+    record_stat,
+    record_duration
+)
+
+# Full 45.0s Battle Timer
+BATTLE_TIMER_DURATION_SEC = 45.0
+
+# ==========================================
+# 1. CLOUD, BATTLEFIELD, TROOP DEPLOYMENT & EARLY VICTORY DETECTORS
+# ==========================================
+
+def is_cloud_screen_a14(img):
+    """
+    Detects if the screen is currently covered in white/light-gray/hazy matchmaking clouds
+    so the bot NEVER confuses matchmaking clouds with the Home Page or an active battlefield.
+    """
+    w, h = img.size
+    px_map = img.load()
+    cloud_px = 0
+    total_px = 0
+
+    for sy in range(200, min(h - 180, 860), 28):
+        for sx in range(350, min(w - 300, 2050), 40):
+            r, g, b = px_map[sx, sy]
+            total_px += 1
+            if r > 175 and g > 175 and b > 165 and (max(r, g, b) - min(r, g, b) <= 38):
+                cloud_px += 1
+
+    return total_px > 0 and (cloud_px / float(total_px)) >= 0.55
+
+def is_enemy_battlefield_loaded_a14(img):
+    """
+    Verifies that:
+      1. We are NOT in matchmaking clouds.
+      2. We are NOT on the Home Page (Green '+' is absent).
+      3. The red/white Surrender / End Battle button at (181, 800) is clearly visible.
+      4. The bottom troop deployment bar (y = 955..1025) has active card contrast.
+    """
+    if is_cloud_screen_a14(img):
+        return False
+    if is_on_home_page_a14(img):
+        return False
+
+    w, h = img.size
+    px_map = img.load()
+    sx_center, sy_center = FAST_ATTACK["SURRENDER_BTN"]
+
+    red_btn_px = 0
+    white_txt_px = 0
+    for dy in range(-22, 23, 2):
+        for dx in range(-45, 46, 3):
+            px = min(max(0, sx_center + dx), w - 1)
+            py = min(max(0, sy_center + dy), h - 1)
+            r, g, b = px_map[px, py]
+            if r > 165 and g < 90 and b < 90:
+                red_btn_px += 1
+            elif r > 200 and g > 200 and b > 200 and (max(r, g, b) - min(r, g, b) <= 30):
+                white_txt_px += 1
+
+    if not (red_btn_px >= 10 and white_txt_px >= 3):
+        return False
+
+    bar_bright_px = 0
+    for tx in range(470, min(w - 100, 1530), 65):
+        r, g, b = px_map[tx, min(h - 10, 985)]
+        if (r + g + b) > 140:
+            bar_bright_px += 1
+
+    return bar_bright_px >= 4
+
+def check_troop_card_grayed_out_a14(img, slot_coord=(470, 988)):
+    """
+    Point #S1 (Real Troop Deployment Verification):
+    Checks if Army 1 card slot (470, 988) or Army 2 slot (590, 985) turned gray/depleted
+    after deployment. When all troops in a slot are deployed on the battlefield, the card
+    loses its bright color saturation (max(r,g,b) - min(r,g,b) drops significantly).
+    """
+    w, h = img.size
+    px_map = img.load()
+    cx, cy = slot_coord
+    colorful_px = 0
+    total_px = 0
+    for dy in range(-24, 25, 4):
+        for dx in range(-28, 29, 4):
+            px = min(max(0, cx + dx), w - 1)
+            py = min(max(0, cy + dy), h - 1)
+            r, g, b = px_map[px, py]
+            total_px += 1
+            if (max(r, g, b) - min(r, g, b)) > 36 and max(r, g, b) > 110:
+                colorful_px += 1
+    if total_px == 0:
+        return True
+    # If fewer than 35% of pixels are brightly saturated, the troop card is grayed out (deployed!)
+    return (colorful_px / float(total_px)) < 0.38
+
+def is_return_home_victory_button_visible_a14(img):
+    """
+    Checks if the green 'Return Home' button at (1222, 918) has appeared on screen.
+    """
+    w, h = img.size
+    px_map = img.load()
+    rx, ry = FAST_ATTACK["RETURN_HOME_BTN"]
+
+    green_px = 0
+    white_px = 0
+    total_px = 0
+    for dy in range(-20, 21, 2):
+        for dx in range(-60, 61, 4):
+            px = min(max(0, rx + dx), w - 1)
+            py = min(max(0, ry + dy), h - 1)
+            r, g, b = px_map[px, py]
+            total_px += 1
+            if g > 135 and g > (r + 25) and g > (b + 25):
+                green_px += 1
+            elif r > 210 and g > 210 and b > 210 and (max(r, g, b) - min(r, g, b) <= 28):
+                white_px += 1
+
+    return total_px > 0 and (green_px / float(total_px)) >= 0.30 and white_px >= 4
+
+def scan_battlefield_or_restart(stage_name, img=None):
+    """
+    Checks Wrong Buttons and Home Page Green '+' icon during attack pauses.
+    If clouds are still visible after 18s, waits up to 8s extra for clouds to clear.
+    """
+    check_pause_point(allow_raise=True)
+    print(f" [SCAN] [{stage_name}] Checking Battlefield, Wrong Buttons & Home Page status...")
+    if img is None:
+        img = get_screenshot(force_fresh=True)
+
+    cloud_wait_extra = 0.0
+    while is_cloud_screen_a14(img) and cloud_wait_extra < 8.0:
+        print(f" [☁️ EXTENDED CLOUD GUARD] [{stage_name}] Clouds still visible ({cloud_wait_extra:.1f}s/8.0s extra)... Waiting 1.0s...")
+        smart_sleep(1.0, apply_speed=False)
+        cloud_wait_extra += 1.0
+        img = get_screenshot(force_fresh=True)
+
+    if is_cloud_screen_a14(img):
+        reason = "Clouds did not clear after extended 26s wait"
+        print(f" [!] [ALERT at {stage_name}] {reason}! Restarting Attack Loop...")
+        raise RestartLoopException(reason)
+
+    wrong_found, home_found, latest_img = check_wrong_and_home_page_a14(img, check_clan_chat=False)
+    if wrong_found or home_found:
+        reason = "Wrong Button detected" if wrong_found else "Still stuck on Home Page (Green '+' visible)"
+        print(f" [!] [ALERT at {stage_name}] {reason}! Restarting Attack Loop...")
+        raise RestartLoopException(reason)
+
+    return latest_img
+
+def wait_for_enemy_base_load_smart(max_wait_sec=18.0):
+    """
+    USER INSTRUCTED FIX:
+      - Reduced initial base load wait limit from 2.5s down to 0.5s!
+      - Starts checking for Enemy Battlefield / Clouds just 0.5s after clicking Attack (1980, 972).
+      - Polls every 0.55s up to 18.0s max.
+    """
+    min_initial_wait = 0.5
+    poll_interval = 0.55
+    print(f" [SMART 18s LOAD] Waiting initial {min_initial_wait:.1f}s (Max {max_wait_sec:.0f}s) for Enemy Base...")
+    start_t = time.time()
+    smart_sleep(min_initial_wait, apply_speed=False)
+
+    while (time.time() - start_t) < max_wait_sec:
+        check_pause_point(allow_raise=True)
+        img = get_screenshot(force_fresh=True)
+        elapsed = time.time() - start_t
+
+        if is_cloud_screen_a14(img):
+            print(f" [☁️ CLOUDS] Matchmaking clouds visible ({elapsed:.1f}s/{max_wait_sec:.0f}s)... Waiting for base...")
+        elif is_enemy_battlefield_loaded_a14(img):
+            print(f" [✔] [BASE LOADED EARLY] Enemy Battlefield & Troop Bar confirmed in {elapsed:.1f}s (Saved {max_wait_sec - elapsed:.1f}s)!")
+            return True
+        else:
+            # Only trigger stuck-on-home retry if >= 2.8s have passed after clicking Attack
+            if elapsed >= 2.8:
+                wrong_found, home_found, _ = check_wrong_and_home_page_a14(img, check_clan_chat=True)
+                if wrong_found or home_found:
+                    reason = "Wrong Button / Clan Chat blocked matchmaking" if wrong_found else f"Stuck on Home Page at {elapsed:.1f}s after Attack click"
+                    print(f" [!] [FAST MATCHMAKING RETRY] {reason}! Restarting Attack Loop...")
+                    raise RestartLoopException(reason)
+
+        rem = max_wait_sec - (time.time() - start_t)
+        if rem <= 0:
+            break
+        smart_sleep(min(poll_interval, rem), apply_speed=False)
+
+    return False
+
+def _deploy_all_troops_and_heroes_sequence():
+    """Executes Army 1 (4 rounds), Army 2 (2 rounds), Siege Machine & Heroes 1-4 (1 round each)."""
+    # Army 1 Select (470, 988) -> 4 Rounds Deploy
+    print(" [DEPLOY] Selecting Army 1 (470, 988) & deploying 4 Rounds in Serial Order...")
+    tap(*FAST_ATTACK["ARMY_1_SELECT"], delay_range=(0.03, 0.05), jitter=2)
+    smart_sleep(0.05, apply_speed=True, min_floor=0.03)
+    fast_serial_taps(FAST_ATTACK["ARMY_1_DEPLOY_LIST"], rounds=4, jitter=3)
+
+    # Army 2 Select (590, 985) -> 2 Rounds Deploy
+    print(" [DEPLOY] Selecting Army 2 (590, 985) & deploying 2 Rounds on 3 Coords...")
+    smart_sleep(0.08, apply_speed=True, min_floor=0.04)
+    tap(*FAST_ATTACK["ARMY_2_SELECT"], delay_range=(0.03, 0.05), jitter=2)
+    smart_sleep(0.05, apply_speed=True, min_floor=0.03)
+    fast_serial_taps(FAST_ATTACK["ARMY_2_DEPLOY_LIST"], rounds=2, jitter=3)
+
+    # Siege Machine + Heroes 1-4 (1 Round each on Army 1 Coords)
+    print(" [DEPLOY] Deploying Siege Machine & Heroes 1-4 (1 Round each on Army 1 Coords)...")
+    siege_and_heroes = [
+        ("Siege Machine", FAST_ATTACK["SIEGE_SELECT"]),
+        ("Hero 1", FAST_ATTACK["HERO_1_SELECT"]),
+        ("Hero 2", FAST_ATTACK["HERO_2_SELECT"]),
+        ("Hero 3", FAST_ATTACK["HERO_3_SELECT"]),
+        ("Hero 4", FAST_ATTACK["HERO_4_SELECT"])
+    ]
+    for unit_name, select_coord in siege_and_heroes:
+        check_pause_point(allow_raise=True)
+        tap(*select_coord, delay_range=(0.03, 0.05), jitter=2)
+        fast_serial_taps(FAST_ATTACK["ARMY_1_DEPLOY_LIST"], rounds=1, jitter=3)
+        smart_sleep(0.03, apply_speed=True, min_floor=0.02)
+
+# ==========================================
+# 2. MASTER FAST ATTACK EXECUTION (6s DEPLOY + 4s WAIT + HERO ABILITY + 4.2s RETURN HOME)
+# ==========================================
+
+def execute_attack(is_first_attack=True):
+    for attempt in range(1, 4):
+        atk_attempt_start_t = time.time()
+        try:
+            check_pause_point(allow_raise=True)
+            print("\n======================================================================")
+            print(f" || [FAST ATTACK LOOP - 45s TIMER] - ATTEMPT #{attempt}/3 ||")
+            print("======================================================================")
+
+            # 1. Home Page: 0.6s Wait + Clan Chat & Wrong Button Check + Single 3x Gold Storage Click
+            print(" [0.6s] Checking Home Page, Clan Chat Drawer & clicking Gold Storage 3x...")
+            smart_sleep(0.60, apply_speed=True)
+            check_wrong_buttons_a14(check_clan_chat=True)
+            click_gold_storage_3_times()
+
+            # 2. Matchmaking (0.20s -> Battle -> 0.35s -> Find Match -> 0.65s -> Attack)
+            print(" [0.20s] Clicking Battle Button (182, 961)...")
+            smart_sleep(0.20, apply_speed=True)
+            tap(*FAST_ATTACK["BATTLE_BTN"], delay_range=(0.0, 0.0), jitter=3)
+
+            print(" [0.35s] Waiting 0.35s -> Clicking Find Match (364, 808)...")
+            smart_sleep(0.35, apply_speed=True)
+            tap(*FAST_ATTACK["FIND_MATCH_BTN"], delay_range=(0.0, 0.0), jitter=3)
+
+            print(" [0.65s] Waiting 0.65s -> Clicking Attack Button (1980, 972)...")
+            smart_sleep(0.65, apply_speed=True)
+            tap(*FAST_ATTACK["ATTACK_BTN"], delay_range=(0.0, 0.0), jitter=3)
+
+            # 3. Smart Enemy Base Load (Starts checking at 0.5s!)
+            loaded_early = wait_for_enemy_base_load_smart(max_wait_sec=18.0)
+            if not loaded_early:
+                scan_battlefield_or_restart("Post-18s Base Load Check")
+
+            # ==================================================================
+            # PHASE 1: SELECT & DEPLOY ALL SPELLS, TROOPS, SIEGE & HEROES WITHIN 6.0 SECONDS!
+            # ==================================================================
+            print(" [⏱ 6s DEPLOY WINDOW] Starting Spells + Army 1/2 + Siege + Heroes 1-4 selection & deployment (Target <= 6.0s)...")
+
+            # Step 4: Spell Select (1527, 983) -> 2 Rounds Deploy (Starts 45s Battle Timer & 6s Deploy Window)
+            tap(*FAST_ATTACK["SPELL_SELECT"], delay_range=(0.03, 0.05), jitter=2)
+            spell_select_timer = time.time()
+            smart_sleep(0.08, apply_speed=True, min_floor=0.04)
+            fast_serial_taps(FAST_ATTACK["SPELL_DEPLOY_LIST"], rounds=2, jitter=3)
+            smart_sleep(0.08, apply_speed=True, min_floor=0.04)
+
+            # Steps 5, 6, 7: Deploy Army 1 (4x), Army 2 (2x), Siege & Heroes 1-4 (1x each)
+            _deploy_all_troops_and_heroes_sequence()
+
+            # Point #S1 & #S2: Verify that troops actually deployed (Army 1 card grayed out).
+            # If the enemy base was zoomed-in, troops won't deploy on buildings -> Immediately 2-Finger Zoom-Out & Re-Deploy!
+            chk_deploy_img = get_screenshot(force_fresh=True)
+            if not check_troop_card_grayed_out_a14(chk_deploy_img, FAST_ATTACK["ARMY_1_SELECT"]):
+                print(" [!] [ZOOMED-IN BASE DETECTED #S1/#S2] Troops did not deploy because camera was zoomed-in! Executing 2-Finger Zoom-Out & Re-Deploying...")
+                zoom_out_village_a14(passes=2, reason="BATTLEFIELD ZOOM-IN RECOVERY")
+                _deploy_all_troops_and_heroes_sequence()
+
+            # Complete the 6.0-second deployment window cleanly
+            elapsed_deploy_window = time.time() - spell_select_timer
+            if elapsed_deploy_window < 6.0:
+                rem_6s = 6.0 - elapsed_deploy_window
+                print(f" [⏱ 6s WINDOW] All units deployed in {elapsed_deploy_window:.2f}s! Completing remaining {rem_6s:.2f}s of 6.0s window...")
+                smart_sleep(rem_6s, apply_speed=False)
+            else:
+                print(f" [⏱ 6s WINDOW] All units selected & deployed in {elapsed_deploy_window:.2f}s!")
+
+            # ==================================================================
+            # PHASE 2: WAIT EXACTLY 4.0 SECONDS AFTER THE 6-SECOND DEPLOYMENT WINDOW!
+            # ==================================================================
+            print(" [⏳ 4.0s POST-DEPLOY WAIT] 6s deployment finished! Waiting 4.0 seconds before activating Hero Abilities...")
+            smart_sleep(4.0, apply_speed=False)
+
+            # ==================================================================
+            # PHASE 3: ACTIVATE HERO 1, 2, 3, 4 ABILITIES (AT ~10.0s MARK)
+            # ==================================================================
+            print(" [⚡ HERO ABILITIES] Activating Hero 1, 2, 3, 4 Abilities...")
+            batch_tap_sequence([
+                FAST_ATTACK["HERO_1_SELECT"],
+                FAST_ATTACK["HERO_2_SELECT"],
+                FAST_ATTACK["HERO_3_SELECT"],
+                FAST_ATTACK["HERO_4_SELECT"]
+            ], inter_delay=0.06, jitter=2)
+
+            total_ability_mark = time.time() - spell_select_timer
+            print(f" [i] Deployment (6s) + Wait (4s) + Hero Abilities completed at {total_ability_mark:.2f}s mark!")
+
+            post_ability_img = get_screenshot(force_fresh=True)
+            battle_ended_early = False
+            if is_return_home_victory_button_visible_a14(post_ability_img):
+                print(f" [✔] [INSTANT VICTORY] Return Home button (1222, 918) already visible at {total_ability_mark:.1f}s!")
+                battle_ended_early = True
+            else:
+                scan_battlefield_or_restart("Post-Hero-4-Ability Check", img=post_ability_img)
+
+            # 9. Wait until 45 seconds from Spell Select (with Early 100% Victory Detection after 20s)
+            while not battle_ended_early:
+                check_pause_point(allow_raise=True)
+                elapsed_since_spell = time.time() - spell_select_timer
+                rem_wait = BATTLE_TIMER_DURATION_SEC - elapsed_since_spell
+                if rem_wait <= 0:
+                    break
+
+                if elapsed_since_spell >= 20.0:
+                    b_img = get_screenshot(force_fresh=True)
+                    if is_return_home_victory_button_visible_a14(b_img):
+                        print(f" [✔] [EARLY BATTLE END] Return Home button (1222, 918) detected at {elapsed_since_spell:.1f}s! Skipping Surrender...")
+                        battle_ended_early = True
+                        break
+                    chunk = min(2.5, rem_wait)
+                    print(f" [45s TIMER] {rem_wait:.1f}s remaining in 45s Battle Timer...")
+                    smart_sleep(chunk, apply_speed=False)
+                else:
+                    wait_to_20 = min(rem_wait, max(0.5, 20.0 - elapsed_since_spell))
+                    print(f" [45s TIMER] Waiting {rem_wait:.1f}s to complete 45s Battle Timer from Spell Select...")
+                    smart_sleep(wait_to_20, apply_speed=False)
+
+            # ==================================================================
+            # 10. FIXED RETURN HOME SEQUENCE (USER INSTRUCTED 4.2s RELIABLE SEQUENCE):
+            #   - Surrender (3x) -> 0.6s -> Click Okay (1419, 701)
+            #   - Wait 2.2 Seconds after Okay so Return Home button reliably appears!
+            #   - Click Return Home (1222, 918) TWICE with a 1.0-second gap:
+            #       Click #1 -> 1.0s Wait -> Click #2 -> 1.0s Wait (Total ~4.2s)
+            #   - Verify Home Page Green '+' before counting attack as Successful!
+            # ==================================================================
+            if not battle_ended_early:
+                print(" [SURRENDER] Clicking Surrender Button (181, 800) 3 times...")
+                batch_tap_sequence([FAST_ATTACK["SURRENDER_BTN"]] * 3, inter_delay=0.08, jitter=3)
+
+                print(" [0.6s] Waiting 0.6s -> Clicking Okay Button (1419, 701)...")
+                smart_sleep(0.60, apply_speed=False)
+                tap(*FAST_ATTACK["OKAY_BTN"], delay_range=(0.08, 0.14), jitter=3, apply_speed=False)
+
+                print(" [2.2s GAP] Waiting 2.2 seconds after Okay for Return Home button to appear...")
+                smart_sleep(2.20, apply_speed=False)
+
+            print(" [RETURN HOME #1/2] Clicking Return Home Button (1222, 918) [1st Click]...")
+            tap(*FAST_ATTACK["RETURN_HOME_BTN"], delay_range=(0.05, 0.08), jitter=3, apply_speed=False)
+            print(" [1.0s GAP] Waiting 1.0 second before 2nd Return Home click...")
+            smart_sleep(1.00, apply_speed=False)
+
+            print(" [RETURN HOME #2/2] Clicking Return Home Button (1222, 918) [2nd Click]...")
+            tap(*FAST_ATTACK["RETURN_HOME_BTN"], delay_range=(0.05, 0.08), jitter=3, apply_speed=False)
+            print(" [1.0s SETTLE] Waiting 1.0 second to settle on Home Page...")
+            smart_sleep(1.00, apply_speed=False)
+
+            # Strictly verify we returned to Home Page before marking Attack as Successful!
+            ret_img = get_screenshot(force_fresh=True)
+            _, home_verified, ret_img = check_wrong_and_home_page_a14(ret_img, check_clan_chat=True)
+
+            if not home_verified:
+                print(" [!] [RETURN HOME GUARD] Home Page Green '+' abhi nahi dikha! Running extra Return Home tap & recovery...")
+                tap(*FAST_ATTACK["RETURN_HOME_BTN"], delay_range=(0.10, 0.18), jitter=3, apply_speed=False)
+                smart_sleep(1.00, apply_speed=False)
+                home_verified = ensure_return_to_home_page_a14()
+
+            if not home_verified:
+                raise RestartLoopException("Could not verify Home Page after Return Home clicks")
+
+            atk_dur = time.time() - atk_attempt_start_t
+            record_stat("attacks_success", 1)
+            record_duration("attack", atk_dur)
+            print(f" [✔] [FAST ATTACK COMPLETE in {atk_dur:.1f}s] Verified back on Home Page!\n")
+            return True
+
+        except BotPausedResumeHomeException:
+            raise
+        except RestartLoopException as re_err:
+            record_stat("attacks_failed", 1)
+            print(f"\n [RESTARTING ATTACK] Attempt #{attempt}/3 interrupted ({re_err}). Recovering Home Page...")
+            ensure_return_to_home_page_a14()
+            smart_sleep(0.40, apply_speed=True)
+            continue
+        except Exception as e:
+            record_stat("attacks_failed", 1)
+            print("\n[! ERROR!] Fast Attack Loop me error aayi:")
+            traceback.print_exc()
+            ensure_return_to_home_page_a14()
+            return False
+
+    print(" [!] [3 ATTEMPTS FAILED] Running Full In-Game Home Recovery...")
+    ensure_return_to_home_page_a14()
+    return False
+EOF
+
+cat << 'EOF' > main_bot.py
+import os
+import json
+import time
+import random
+import traceback
+import bot_tools
+from bot_tools import (
+    BotPausedResumeHomeException,
+    start_pause_resume_listener,
+    check_pause_point,
+    smart_sleep,
+    human_sleep,
+    set_bot_speed_multiplier,
+    get_bot_speed_multiplier,
+    check_wrong_buttons_a14,
+    check_daily_reward_popup,
+    check_and_handle_maintenance_break,
+    run_zone2_home_periodic_checks,
+    double_click_storage_bars,
+    perform_home_cleanup_once,
+    ensure_return_to_home_page_a14,
+    check_resources_full_for_upgrade,
+    zoom_out_village_a14,
+    clean_ram_garbage,
+    reset_session_progress_report,
+    print_previous_progress_report,
+    record_stat
+)
+from bot_upgrade import (
+    run_a14_combined_upgrade_loop,
+    run_a14_buildings_only_upgrade_loop,
+    run_custom_mode_upgrade_loop
+)
+from bot_attack import execute_attack
+from bot_id_switch import (
+    load_id_memory,
+    save_id_memory,
+    get_id_role_label,
+    switch_to_target_id,
+    sync_initial_id_to_report
+)
+
+CUSTOM_PRESET_FILE = "bot_custom_preset.json"
+
+# ==========================================
+# 1. ADVANCE FEATURES MENU (SPEED-UP 1.0x-2.25x) & OPTION [9] CUSTOM MODE BUILDER (#S5)
+# ==========================================
+
+ADVANCE_SPEED_TABLE = [
+    ("A", 1.00, "Standard Speed (Default - 100% As Coded)"),
+    ("B", 1.10, "1.10x Fast Speed"),
+    ("C", 1.15, "1.15x Fast Speed"),
+    ("D", 1.20, "1.20x Fast Speed"),
+    ("E", 1.25, "1.25x Fast Speed"),
+    ("F", 1.30, "1.30x Fast Speed"),
+    ("G", 1.35, "1.35x Fast Speed"),
+    ("H", 1.40, "1.40x Fast Speed"),
+    ("I", 1.45, "1.45x Fast Speed"),
+    ("J", 1.50, "1.50x Turbo Speed"),
+    ("K", 1.55, "1.55x Turbo Speed"),
+    ("L", 1.60, "1.60x Turbo Speed"),
+    ("M", 1.65, "1.65x Turbo Speed"),
+    ("N", 1.70, "1.70x Turbo Speed"),
+    ("O", 1.75, "1.75x Turbo Speed"),
+    ("P", 1.80, "1.80x Ultra Speed"),
+    ("Q", 1.85, "1.85x Ultra Speed"),
+    ("R", 1.90, "1.90x Ultra Speed"),
+    ("S", 1.95, "1.95x Ultra Speed"),
+    ("T", 2.00, "2.00x Ultra Speed"),
+    ("U", 2.05, "2.05x Extreme Speed"),
+    ("V", 2.10, "2.10x Extreme Speed"),
+    ("W", 2.15, "2.15x Extreme Speed"),
+    ("X", 2.20, "2.20x Extreme Speed"),
+    ("Y", 2.25, "2.25x Maximum Speed Limit")
+]
+
+def load_custom_preset():
+    default_preset = {
+        "combo_type": "1+2+3",                # "1+3" (Atk+Switch), "1+2" (Atk+Upg), "1+2+3" (All Three)
+        "attacks_per_round": 5,               # Default 5 Attacks
+        "upgrade_order": "BUILDING_THEN_WALL",# "BUILDING_THEN_WALL", "WALL_THEN_BUILDING", "BUILDING_ONLY", "WALL_ONLY"
+        "check_storage": False,               # False = Direct Upgrade without storage check, True = Check storage box
+        "stop_builders": 0,                   # 0 = Upgrade until Builders == 0, 1 = Leave 1 builder
+        "rounds_per_id": 3                    # Default 3 attempts/rounds of (5 Atk -> Upgrade) before switching ID
+    }
+    if not os.path.exists(CUSTOM_PRESET_FILE):
+        return default_preset
+    try:
+        with open(CUSTOM_PRESET_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                default_preset.update(data)
+    except Exception:
+        pass
+    return default_preset
+
+def save_custom_preset(preset_data):
+    try:
+        with open(CUSTOM_PRESET_FILE, "w", encoding="utf-8") as f:
+            json.dump(preset_data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def configure_custom_mode_9():
+    """
+    Option [9] -> Create Options (Manual Custom Mode Builder + Saved Preset #S5):
+    Allows the user to manually combine:
+      - 1 + 3 (Fast Attack + ID Switching)
+      - 1 + 2 (Fast Attack + Fast Upgrading)
+      - 1 + 2 + 3 (Fast Attack + Fast Upgrading + ID Switching)
+    And customize:
+      - Attacks per round (Default = 5)
+      - Upgrade sequence: Building -> Wall, Wall -> Building, Building Only, or Wall Only
+      - Builder stop target: 0 Builders or 1 Builder
+      - Repeat Rounds / Attempts per ID before ID Switch (e.g., 3 Attempts -> ID Switch)
+    """
+    preset = load_custom_preset()
+    print("\n==============================================================================")
+    print(" ||         🛠️  OPTION [9]: CREATE OPTIONS (MANUAL CUSTOM BUILDER)  🛠️       ||")
+    print("==============================================================================")
+    print(" || Saved Custom Preset Summary:                                             ||")
+    print(f" ||   • Combination      : {preset['combo_type']}                                              ||")
+    print(f" ||   • Attacks / Round  : {preset['attacks_per_round']} Fast Attacks                                    ||")
+    print(f" ||   • Upgrade Sequence : {preset['upgrade_order']}                             ||")
+    print(f" ||   • Storage Check    : {'Yes' if preset['check_storage'] else 'No (Direct Fast Upgrade)'}                               ||")
+    print(f" ||   • Builder Target   : Stop at {preset['stop_builders']} Builder(s)                                ||")
+    print(f" ||   • Attempts per ID  : {preset['rounds_per_id']} Round(s) before ID Switch                       ||")
+    print("==============================================================================")
+
+    use_saved = input("\n Kya pichhla Saved Custom Preset use karein? (y/n) [Default=y]: ").strip().lower()
+    if use_saved in ["", "y", "yes"]:
+        return preset
+
+    print("\n [STEP 1] Select System Combination:")
+    print("   [1] -> 1 + 3 : Fast Attack + ID Switching Only")
+    print("   [2] -> 1 + 2 : Fast Attack + Fast Upgrading Only")
+    print("   [3] -> 1 + 2 + 3 : Fast Attack + Fast Upgrading + ID Switching (Full Custom Sequence)")
+    c_in = input(" Option type karein (1/2/3) [Default=3 (1+2+3)]: ").strip()
+    if c_in == "1":
+        preset["combo_type"] = "1+3"
+    elif c_in == "2":
+        preset["combo_type"] = "1+2"
+    else:
+        preset["combo_type"] = "1+2+3"
+
+    raw_atk = input(f"\n [STEP 2] Har round me kitne Fast Attacks karne hain? (1 se 50) [Default={preset['attacks_per_round']}]: ").strip()
+    if raw_atk.isdigit() and 1 <= int(raw_atk) <= 50:
+        preset["attacks_per_round"] = int(raw_atk)
+
+    if "2" in preset["combo_type"]:
+        print("\n [STEP 3] Select Upgrade Category & Sequence Order:")
+        print("   [1] -> Building Upgrade FIRST -> then Wall Upgrade")
+        print("   [2] -> Wall Upgrade FIRST -> then Building Upgrade")
+        print("   [3] -> Building Upgrade ONLY (No Wall)")
+        print("   [4] -> Wall Upgrade ONLY (No Building)")
+        u_in = input(" Option type karein (1/2/3/4) [Default=1]: ").strip()
+        if u_in == "2":
+            preset["upgrade_order"] = "WALL_THEN_BUILDING"
+        elif u_in == "3":
+            preset["upgrade_order"] = "BUILDING_ONLY"
+        elif u_in == "4":
+            preset["upgrade_order"] = "WALL_ONLY"
+        else:
+            preset["upgrade_order"] = "BUILDING_THEN_WALL"
+
+        st_in = input("\n [STEP 4] Upgrade se pehle Storage Box check karein ya Direct Upgrade? (d=Direct / c=Check) [Default=d]: ").strip().lower()
+        preset["check_storage"] = (st_in == "c")
+
+        b_in = input("\n [STEP 5] Builders kitne bachne par upgrade close karein? (0 = Zero Builders / 1 = One Builder) [Default=0]: ").strip()
+        preset["stop_builders"] = 1 if b_in == "1" else 0
+
+    if "3" in preset["combo_type"]:
+        r_in = input(f"\n [STEP 6] Ek ID par (Attack + Upgrade) kitne Attempts/Rounds chalane ke baad ID Switch karein? (1 se 10) [Default=3]: ").strip()
+        if r_in.isdigit() and 1 <= int(r_in) <= 10:
+            preset["rounds_per_id"] = int(r_in)
+        else:
+            preset["rounds_per_id"] = 3
+
+    save_custom_preset(preset)
+    print(" [✔] Custom Option [9] Preset saved successfully!")
+    return preset
+
+def open_advance_features_menu():
+    letter_to_speed = {letter: mult for letter, mult, _ in ADVANCE_SPEED_TABLE}
+
+    while True:
+        cur_spd = get_bot_speed_multiplier()
+        print("\n======================================================================")
+        print(" ||        ⚡ ADVANCE FEATURES MENU - GAME SPEED-UP SYSTEM ⚡        ||")
+        print("======================================================================")
+        print(f" || Current Active Bot Speed : {cur_spd:.2f}x                               ||")
+        print("----------------------------------------------------------------------")
+        print(" || Select Game Speed-Up Option (A to Y):                          ||")
+        for letter, mult, desc in ADVANCE_SPEED_TABLE:
+            marker = " <-- [ACTIVE]" if abs(cur_spd - mult) < 0.005 else ""
+            print(f" ||   [{letter}] -> {mult:.2f}x  ({desc}){marker}")
+        print("----------------------------------------------------------------------")
+        print(" ||   [R] -> View Current / Previous Progress Report               ||")
+        print(" ||   [0] -> Back to Main Bot Operating Menu                       ||")
+        print("======================================================================")
+
+        raw_in = input("\n Speed Option type karein (A se Y tak, R report ke liye, ya 0 wapas jane ke liye) [Default=A]: ").strip().upper()
+        if raw_in == "":
+            set_bot_speed_multiplier(1.00)
+            break
+        if raw_in == "0":
+            break
+        if raw_in == "R":
+            print_previous_progress_report(report_stage="MENU PREVIEW")
+            continue
+        if raw_in in letter_to_speed:
+            chosen_mult = letter_to_speed[raw_in]
+            set_bot_speed_multiplier(chosen_mult)
+            print(f" [✔] Root-Level Game Speed-Up '{raw_in}' ({chosen_mult:.2f}x) successfully activate ho gaya hai!")
+            break
+        try:
+            val = float(raw_in.replace("X", ""))
+            if 1.0 <= val <= 2.25:
+                set_bot_speed_multiplier(val)
+                print(f" [✔] Custom Root-Level Game Speed-Up ({val:.2f}x) successfully activate ho gaya hai!")
+                break
+        except Exception:
+            pass
+        print(" [!] Galat input! Kripya A se Y ke beech ka letter (jaise A, B, C, D, E...) type karein.")
+
+def select_bot_configuration():
+    while True:
+        cur_spd = get_bot_speed_multiplier()
+        print("\n==============================================================================")
+        print(" ||      CLASH OF CLANS AI BOT v7 - SAMSUNG GALAXY A14 ULTIMATE EDITION      ||")
+        print("==============================================================================")
+        print(f" || Active Game Speed Multiplier : {cur_spd:.2f}x {'(Standard Default)' if abs(cur_spd - 1.0) < 0.005 else '(Root Speed-Up Active!)'}")
+        print("------------------------------------------------------------------------------")
+        print(" || Select Bot Operating Mode (1 to 9):                                      ||")
+        print(" || [1] -> Fast Attack Only                  (सिर्फ फास्ट अटैक - Infinity)      ||")
+        print(" || [2] -> Combined Upgrade Only             (बिल्डिंग + वॉल अपग्रेड - 1m Gap)  ||")
+        print(" || [3] -> Tried All                         (Combined Upgrade + 10 Attacks) ||")
+        print(" || [4] -> ID Changement Only                (सिर्फ ID चेंज - हर 2 सेकंड में)    ||")
+        print(" || [5] -> ID Changement + Fast Attack       (हर ID पर 10 Min अटैक स्विच)      ||")
+        print(" || [6] -> ID Changement + Tried All         (Fully Botted System - Default) ||")
+        print(" || [7] -> Advance Features                  (Game Speed-Up: 1.00x to 2.25x) ||")
+        print(" || [8] -> Fast Tried With Building Upgrade  (5 Atk -> Direct Bld Up -> 1s)  ||")
+        print(" || [9] -> Create Options (Custom Builder)   (1+3 / 1+2 / 5 Atk+Bld+Wall+3x) ||")
+        print("==============================================================================")
+        print(" || Live Controls Inside Termux:                                             ||")
+        print(" || Pause & Show Progress Report : Type 'ZX' (or 'zx') anytime               ||")
+        print(" || Resume Bot (Same Speed/State): Type 'QW' (or 'qw') anytime               ||")
+        print(" || Stop & Final Progress Report : Press Ctrl+C anytime                      ||")
+        print("==============================================================================")
+
+        choice = input("\n Apna Option type karein (1/2/3/4/5/6/7/8/9) [Default=6]: ").strip()
+        if choice == "":
+            choice = "6"
+
+        if choice == "7":
+            open_advance_features_menu()
+            continue
+
+        if choice in ["1", "2", "3", "4", "5", "6", "8", "9"]:
+            break
+        print(" [!] Galat input! Kripya 1 se 9 ke beech ka number type karein.")
+
+    custom_cfg = load_custom_preset()
+    if choice == "9":
+        custom_cfg = configure_custom_mode_9()
+
+    mode_names = {
+        "1": "MODE 1: FAST ATTACK ONLY (Infinity)",
+        "2": "MODE 2: COMBINED UPGRADE ONLY (1 Min Gap)",
+        "3": "MODE 3: TRIED ALL (Combined Upgrade + 10 Fast Attacks)",
+        "4": "MODE 4: ID CHANGEMENT ONLY (2s Hold + Fast Dynamic Switch)",
+        "5": "MODE 5: ID CHANGEMENT + FAST ATTACK (10 Min per ID)",
+        "6": "MODE 6: ID CHANGEMENT + TRIED ALL (Fully Botted System)",
+        "8": "MODE 8: FAST TRIED WITH BUILDING UPGRADE (Fast Attacks -> Direct Building Upgrade -> 1s Switch)",
+        "9": f"MODE 9: CUSTOM ({custom_cfg['combo_type']} | {custom_cfg['attacks_per_round']} Atk | {custom_cfg['upgrade_order']} | {custom_cfg['rounds_per_id']}x Rounds)"
+    }
+    print(f"\n [✔] Selected Mode: [{choice}] -> {mode_names[choice]} | Speed: {get_bot_speed_multiplier():.2f}x")
+
+    total_ids = 1
+    start_id_index = 1
+    mode8_attacks_per_id = 5
+
+    needs_id_config = (choice in ["4", "5", "6", "8"]) or (choice == "9" and "3" in custom_cfg["combo_type"])
+    if needs_id_config:
+        mem = load_id_memory()
+        default_total = mem.get("total_ids", 10)
+        if default_total < 1 or default_total > 100:
+            default_total = 10
+
+        while True:
+            raw_total = input(f" Total IDs type karein (1 se 100 ke beech, First 4 = Main ID) [Default={default_total}]: ").strip()
+            if raw_total == "":
+                total_ids = default_total
+                break
+            if raw_total.isdigit() and 1 <= int(raw_total) <= 100:
+                total_ids = int(raw_total)
+                break
+            print(" [!] Kripya 1 se 100 ke beech ka sahi number type karein.")
+
+        if choice == "8":
+            default_m8_atk = mem.get("mode8_attacks_per_id", 5)
+            if not isinstance(default_m8_atk, int) or default_m8_atk < 1 or default_m8_atk > 50:
+                default_m8_atk = 5
+            while True:
+                raw_atk = input(f" [MODE 8] Har ID par kitne Fast Attacks karne hain? (1 se 50) [Default={default_m8_atk}]: ").strip()
+                if raw_atk == "":
+                    mode8_attacks_per_id = default_m8_atk
+                    break
+                if raw_atk.isdigit() and 1 <= int(raw_atk) <= 50:
+                    mode8_attacks_per_id = int(raw_atk)
+                    break
+                print(" [!] Kripya 1 se 50 ke beech ka sahi attack number type karein.")
+            mem["mode8_attacks_per_id"] = mode8_attacks_per_id
+
+        saved_idx = mem.get("current_id_index", 1)
+        if 1 < saved_idx <= total_ids:
+            ans = input(f" Pichhli baar Bot ID #{saved_idx} par tha. Kya ID #{saved_idx} se Resume karein? (y/n) [Default=n (Start from ID #1)]: ").strip().lower()
+            if ans == "y":
+                start_id_index = saved_idx
+
+        mem["total_ids"] = total_ids
+        mem["current_id_index"] = start_id_index
+        save_id_memory(mem)
+        print(f" [✔] ID Changement Configured: Total IDs = {total_ids} | Starting on ID #{start_id_index} [{get_id_role_label(start_id_index)}]")
+
+    mode_summary_label = mode_names[choice] + (f" ({mode8_attacks_per_id} Atk/ID)" if choice == "8" else "")
+    reset_session_progress_report(mode_label=mode_summary_label)
+    sync_initial_id_to_report(start_id_index)
+
+    input("\n Bot Start karne ke liye [ENTER] key dabayein: ")
+    return choice, total_ids, start_id_index, mode8_attacks_per_id, custom_cfg
+
+# ==========================================
+# 2. MASTER COMBINED UPGRADE & ATTACK HELPERS
+# ==========================================
+
+def run_combined_building_and_wall_upgrade(loop_label="COMBINED UPGRADE"):
+    check_pause_point(allow_raise=True)
+    print("\n----------------------------------------------------------------------")
+    print(f" | [{loop_label}] Single Storage Check -> Building -> Wall Handoff |")
+    print("----------------------------------------------------------------------")
+
+    if perform_home_cleanup_once(max_age_sec=1.5):
+        human_sleep(0.18, 0.04)
+
+    img = bot_tools.get_screenshot()
+    check_and_handle_maintenance_break(img)
+
+    print(f"\n [{loop_label}] Checking Gold & Elixir Storage Boxes for Combined Upgrade...")
+    if check_resources_full_for_upgrade(img):
+        print(" [+] Storage Box is FULL! Starting Combined Upgrade (Building -> Wall) in 0.20s...")
+        human_sleep(0.20, 0.04)
+        b_up, w_up, any_up = run_a14_combined_upgrade_loop()
+    else:
+        print(" [-] Storage Box is not full yet. Skipping Combined Upgrade...")
+        b_up, w_up, any_up = False, False, False
+
+    print(f" [{loop_label} RESULT] Building Upgraded: {b_up} | Wall Upgraded: {w_up} | Any Upgraded: {any_up}")
+    return b_up, w_up, any_up
+
+def run_n_fast_attacks_with_resume_memory(state_dict, target_attacks, phase_label="ATTACK SERIES"):
+    consecutive_failed_attacks = 0
+
+    while state_dict["attacks_done"] < target_attacks:
+        check_pause_point(allow_raise=True)
+        next_atk_num = state_dict["attacks_done"] + 1
+        pre_attack_wait = random.uniform(0.20, 0.38)
+        print(f"\n [{phase_label}] Attack #{next_atk_num} / {target_attacks} starting in {pre_attack_wait:.2f}s (Speed={get_bot_speed_multiplier():.2f}x)...")
+        smart_sleep(pre_attack_wait, apply_speed=True)
+
+        atk_ok = execute_attack(is_first_attack=(next_atk_num == 1))
+        if atk_ok:
+            consecutive_failed_attacks = 0
+            state_dict["attacks_done"] += 1
+            print(f" [✔] [{phase_label}] Completed Attack #{state_dict['attacks_done']} / {target_attacks}!")
+        else:
+            consecutive_failed_attacks += 1
+            print(f" [!] [{phase_label}] Attack #{next_atk_num} unsuccessful (Consecutive Fails: {consecutive_failed_attacks}/2).")
+            if consecutive_failed_attacks >= 2:
+                print(" [🛡 SMART RECOVERY] 2 consecutive full attacks failed on this ID! Advancing to next phase...")
+                ensure_return_to_home_page_a14()
+                break
+
+        if state_dict["attacks_done"] > 0 and (state_dict["attacks_done"] % 5 == 0) and (state_dict["attacks_done"] < target_attacks):
+            print(f" [🔍 HEALTH CHECK] 5-Attack milestone ({state_dict['attacks_done']}/{target_attacks}) -> Checking Clan Chat, Daily Reward & Maintenance...")
+            run_zone2_home_periodic_checks()
+
+    run_zone2_home_periodic_checks()
+
+# ==========================================
+# 3. MASTER LOOP CONTROLLER (MODES 1 TO 9 + AUTO ZOOM-OUT + NIGHT WATCHDOG)
+# ==========================================
+
+def main_loop():
+    bot_mode, total_ids, current_id, mode8_attacks_per_id, custom_cfg = select_bot_configuration()
+
+    # Start background keyboard listener for 'ZX' (Pause + Report) and 'QW' (Resume)
+    start_pause_resume_listener()
+
+    # Initial 2-Finger Zoom-Out on Home Page at startup so village starts zoomed-out!
+    zoom_out_village_a14(passes=2, reason="BOT STARTUP INITIAL ZOOM-OUT")
+
+    if bot_mode in ["8", "9"]:
+        print(f"\n[MODE {bot_mode} STARTUP] Waiting 1.0 second on ID #{current_id} before starting...")
+        smart_sleep(1.0, apply_speed=True)
+    else:
+        startup_rest = random.uniform(0.8, 1.2)
+        print(f"\n[STARTUP] Taking {startup_rest:.1f} seconds initial rest on Home Page (Speed={get_bot_speed_multiplier():.2f}x)...")
+        smart_sleep(startup_rest, apply_speed=True)
+
+    cycle_count = 1
+    consecutive_loop_errors = 0
+
+    runtime_state = {
+        "current_id": current_id,
+        "phase": "START_CYCLE",
+        "attacks_done": 0,
+        "custom_round_idx": 1,
+        "id_timer_start": None,
+        "id_elapsed_sec": 0.0,
+        "loop2_any_upgraded": False
+    }
+
+    while True:
+        try:
+            check_pause_point(allow_raise=True)
+            active_id = runtime_state["current_id"]
+            id_role = get_id_role_label(active_id)
+            cur_spd = get_bot_speed_multiplier()
+
+            print("\n" + "=" * 74)
+            if bot_mode in ["4", "5", "6", "8", "9"]:
+                print(f" MASTER CYCLE #{cycle_count} | MODE: [{bot_mode}] | SPEED: {cur_spd:.2f}x | ACTIVE ID: #{active_id}/{total_ids} [{id_role}]")
+            else:
+                print(f" MASTER CYCLE #{cycle_count} | MODE: [{bot_mode}] | SPEED: {cur_spd:.2f}x")
+            print("=" * 74)
+
+            run_zone2_home_periodic_checks()
+
+            # ------------------------------------------------------------------
+            # MODE 1: FAST ATTACK ONLY (Continues Infinitely)
+            # ------------------------------------------------------------------
+            if bot_mode == "1":
+                pre_wait = random.uniform(0.20, 0.38)
+                print(f" [MODE 1] Starting Fast Attack in {pre_wait:.2f}s...")
+                smart_sleep(pre_wait, apply_speed=True)
+                execute_attack(is_first_attack=(cycle_count == 1))
+
+            # ------------------------------------------------------------------
+            # MODE 2: COMBINED UPGRADE ONLY (Building + Wall Combined - Every 1 Minute Gap)
+            # ------------------------------------------------------------------
+            elif bot_mode == "2":
+                run_combined_building_and_wall_upgrade("MODE 2 COMBINED UPGRADE")
+                print(" [MODE 2] Waiting 1 Minute (60s) before next Combined Upgrade resource check...")
+                smart_sleep(60.0, apply_speed=False)
+
+            # ------------------------------------------------------------------
+            # MODE 3: TRIED ALL (Combined Upgrade -> 10 Fast Attacks -> Repeat)
+            # ------------------------------------------------------------------
+            elif bot_mode == "3":
+                if runtime_state["phase"] == "START_CYCLE":
+                    run_combined_building_and_wall_upgrade("MODE 3 COMBINED UPGRADE")
+                    runtime_state["phase"] = "ATTACK_10"
+                    runtime_state["attacks_done"] = 0
+
+                if runtime_state["phase"] == "ATTACK_10":
+                    run_n_fast_attacks_with_resume_memory(
+                        runtime_state,
+                        target_attacks=10,
+                        phase_label="MODE 3 (10-ATTACK LOOP)"
+                    )
+                    runtime_state["phase"] = "START_CYCLE"
+                    runtime_state["attacks_done"] = 0
+
+            # ------------------------------------------------------------------
+            # MODE 4: ID CHANGEMENT ONLY (Wait 2 Seconds on each ID -> Switch ID -> Loop 1..N)
+            # ------------------------------------------------------------------
+            elif bot_mode == "4":
+                print(f" [MODE 4] Spending 2 Seconds on ID #{active_id}/{total_ids} [{id_role}]...")
+                perform_home_cleanup_once(max_age_sec=1.0)
+                smart_sleep(2.0, apply_speed=True)
+
+                next_id = (active_id % total_ids) + 1
+                print(f" [MODE 4] 2 Seconds complete! Switching from ID #{active_id} -> ID #{next_id}/{total_ids}...")
+                switch_to_target_id(next_id, total_ids, current_id_index=active_id)
+                runtime_state["current_id"] = next_id
+
+            # ------------------------------------------------------------------
+            # MODE 5: ID CHANGEMENT + FAST ATTACK (10 Minutes Fast Attack per ID -> Switch ID)
+            # ------------------------------------------------------------------
+            elif bot_mode == "5":
+                target_duration_sec = 600.0
+                if runtime_state["id_timer_start"] is None:
+                    runtime_state["id_timer_start"] = time.time()
+                    runtime_state["attacks_done"] = 0
+                    print(f" [MODE 5] Started 10-Minute Fast Attack Timer on ID #{active_id}/{total_ids} [{id_role}]!")
+
+                while True:
+                    check_pause_point(allow_raise=True)
+                    elapsed_total = runtime_state["id_elapsed_sec"] + (time.time() - runtime_state["id_timer_start"])
+                    remaining_sec = target_duration_sec - elapsed_total
+
+                    if remaining_sec <= 0:
+                        print(f"\n [10 MIN COMPLETE] Spent {elapsed_total/60.0:.1f} minutes ({runtime_state['attacks_done']} attacks) on ID #{active_id}!")
+                        break
+
+                    atk_no = runtime_state["attacks_done"] + 1
+                    print(f"\n [MODE 5 | ID #{active_id}] Starting Fast Attack #{atk_no} (Time elapsed: {elapsed_total/60.0:.1f}m / 10.0m)...")
+                    pre_wait = random.uniform(0.20, 0.38)
+                    smart_sleep(pre_wait, apply_speed=True)
+
+                    execute_attack(is_first_attack=(atk_no == 1))
+                    runtime_state["attacks_done"] += 1
+
+                next_id = (active_id % total_ids) + 1
+                switch_to_target_id(next_id, total_ids, current_id_index=active_id)
+                runtime_state["current_id"] = next_id
+                runtime_state["id_timer_start"] = None
+                runtime_state["id_elapsed_sec"] = 0.0
+                runtime_state["attacks_done"] = 0
+
+            # ------------------------------------------------------------------
+            # MODE 6: ID CHANGEMENT + TRIED ALL (FULLY BOTTED SYSTEM)
+            # ------------------------------------------------------------------
+            elif bot_mode == "6":
+                if runtime_state["phase"] == "START_CYCLE":
+                    run_combined_building_and_wall_upgrade(f"ID #{active_id} - COMBINED UPGRADE LOOP #1")
+                    runtime_state["phase"] = "ATTACK_10"
+                    runtime_state["attacks_done"] = 0
+
+                if runtime_state["phase"] == "ATTACK_10":
+                    run_n_fast_attacks_with_resume_memory(
+                        runtime_state,
+                        target_attacks=10,
+                        phase_label=f"ID #{active_id} - 10 FAST ATTACKS"
+                    )
+                    runtime_state["phase"] = "UPGRADE_LOOP_2"
+                    runtime_state["attacks_done"] = 0
+
+                if runtime_state["phase"] == "UPGRADE_LOOP_2":
+                    _, _, any_up_2 = run_combined_building_and_wall_upgrade(f"ID #{active_id} - COMBINED UPGRADE LOOP #2")
+                    runtime_state["loop2_any_upgraded"] = any_up_2
+
+                    if any_up_2:
+                        print("\n [MODE 6 RULE] Combined Upgrade Loop #2 me upgrade safal raha! Attack rok kar seedha Next ID par switch kar rahe hain...")
+                        runtime_state["phase"] = "SWITCH_ID"
+                    else:
+                        print("\n [i MODE 6 RULE] Combined Upgrade Loop #2 me koi upgrade nahi hua! Ab 5 Fast Attacks karenge phir ID switch karenge...")
+                        runtime_state["phase"] = "ATTACK_5"
+                        runtime_state["attacks_done"] = 0
+
+                if runtime_state["phase"] == "ATTACK_5":
+                    run_n_fast_attacks_with_resume_memory(
+                        runtime_state,
+                        target_attacks=5,
+                        phase_label=f"ID #{active_id} - 5 EXTRA FAST ATTACKS"
+                    )
+                    runtime_state["phase"] = "SWITCH_ID"
+                    runtime_state["attacks_done"] = 0
+
+                if runtime_state["phase"] == "SWITCH_ID":
+                    next_id = (active_id % total_ids) + 1
+                    switch_to_target_id(next_id, total_ids, current_id_index=active_id)
+                    runtime_state["current_id"] = next_id
+                    runtime_state["phase"] = "START_CYCLE"
+                    runtime_state["attacks_done"] = 0
+                    runtime_state["loop2_any_upgraded"] = False
+
+            # ------------------------------------------------------------------
+            # MODE 8: FAST TRIED WITH BUILDING UPGRADE
+            # ------------------------------------------------------------------
+            elif bot_mode == "8":
+                if runtime_state["phase"] in ["START_CYCLE", "MODE8_ATTACKS"]:
+                    runtime_state["phase"] = "MODE8_ATTACKS"
+                    run_n_fast_attacks_with_resume_memory(
+                        runtime_state,
+                        target_attacks=mode8_attacks_per_id,
+                        phase_label=f"MODE 8 | ID #{active_id} ({mode8_attacks_per_id} FAST ATTACKS)"
+                    )
+                    runtime_state["phase"] = "MODE8_BUILDING_UPGRADE"
+                    runtime_state["attacks_done"] = 0
+
+                if runtime_state["phase"] == "MODE8_BUILDING_UPGRADE":
+                    print(f"\n [⚡ MODE 8 DIRECT UPGRADE] {mode8_attacks_per_id} Attacks complete! Bina Storage Check kiye seedha Building Upgrade par ja rahe hain...")
+                    run_a14_buildings_only_upgrade_loop(stop_at_builders=1)
+                    runtime_state["phase"] = "MODE8_SWITCH_ID"
+
+                if runtime_state["phase"] == "MODE8_SWITCH_ID":
+                    print(" [⏱ MODE 8] Waiting 1.0 second after Building Upgrade before ID Switch...")
+                    smart_sleep(1.0, apply_speed=True)
+
+                    next_id = (active_id % total_ids) + 1
+                    switch_to_target_id(next_id, total_ids, current_id_index=active_id)
+                    runtime_state["current_id"] = next_id
+                    runtime_state["phase"] = "START_CYCLE"
+                    runtime_state["attacks_done"] = 0
+
+                    print(f" [⏱ MODE 8] Arrived on ID #{next_id}! Waiting 1.0 second before starting {mode8_attacks_per_id} Fast Attacks...")
+                    smart_sleep(1.0, apply_speed=True)
+
+            # ------------------------------------------------------------------
+            # MODE 9: CREATE OPTIONS (MANUAL CUSTOM BUILDER: 1+3 / 1+2 / 1+2+3 WITH MULTI-ROUND SUPPORT)
+            # ------------------------------------------------------------------
+            elif bot_mode == "9":
+                combo = custom_cfg.get("combo_type", "1+2+3")
+                atk_target = int(custom_cfg.get("attacks_per_round", 5))
+                upg_order = custom_cfg.get("upgrade_order", "BUILDING_THEN_WALL")
+                chk_store = bool(custom_cfg.get("check_storage", False))
+                stop_b = int(custom_cfg.get("stop_builders", 0))
+                max_rounds = int(custom_cfg.get("rounds_per_id", 3)) if "3" in combo else 1
+
+                while runtime_state["custom_round_idx"] <= max_rounds:
+                    r_no = runtime_state["custom_round_idx"]
+                    print(f"\n [🛠️ CUSTOM MODE 9] ID #{active_id} | Attempt/Round #{r_no}/{max_rounds} | Combo={combo} | Order={upg_order}")
+
+                    # Step A: Fast Attacks
+                    if runtime_state["phase"] in ["START_CYCLE", "CUSTOM_ATTACKS"]:
+                        runtime_state["phase"] = "CUSTOM_ATTACKS"
+                        run_n_fast_attacks_with_resume_memory(
+                            runtime_state,
+                            target_attacks=atk_target,
+                            phase_label=f"CUSTOM MODE 9 | ID #{active_id} (Round {r_no}/{max_rounds} - {atk_target} ATTACKS)"
+                        )
+                        runtime_state["phase"] = "CUSTOM_UPGRADE"
+                        runtime_state["attacks_done"] = 0
+
+                    # Step B: Custom Upgrade (if '2' is in combo)
+                    if runtime_state["phase"] == "CUSTOM_UPGRADE":
+                        if "2" in combo:
+                            do_upg = True
+                            if chk_store:
+                                perform_home_cleanup_once(max_age_sec=1.5)
+                                do_upg = check_resources_full_for_upgrade()
+                            if do_upg:
+                                run_custom_mode_upgrade_loop(order_type=upg_order, stop_at_builders=stop_b)
+                                # If builders reached 0 during this round, no need to do extra rounds on this ID!
+                                if bot_tools.LAST_DETECTED_BUILDERS is not None and bot_tools.LAST_DETECTED_BUILDERS <= 0:
+                                    print(f" [✔] [CUSTOM MODE 9] Builders reached 0 on Round #{r_no}! Proceeding to ID Switch...")
+                                    runtime_state["custom_round_idx"] = max_rounds + 1
+                                    break
+                        runtime_state["custom_round_idx"] += 1
+                        runtime_state["phase"] = "START_CYCLE"
+
+                # Step C: Switch ID (if '3' is in combo)
+                if "3" in combo:
+                    smart_sleep(1.0, apply_speed=True)
+                    next_id = (active_id % total_ids) + 1
+                    switch_to_target_id(next_id, total_ids, current_id_index=active_id)
+                    runtime_state["current_id"] = next_id
+                    smart_sleep(1.0, apply_speed=True)
+
+                runtime_state["custom_round_idx"] = 1
+                runtime_state["phase"] = "START_CYCLE"
+                runtime_state["attacks_done"] = 0
+
+            clean_ram_garbage()
+            consecutive_loop_errors = 0
+
+            print(f"\n[SUCCESS] Master Cycle #{cycle_count} Completed! (Speed={get_bot_speed_multiplier():.2f}x)")
+            cycle_count += 1
+            smart_sleep(random.uniform(0.40, 0.70), apply_speed=True)
+
+        except BotPausedResumeHomeException as resume_sig:
+            print(f"\n[RESUME HANDLER] {resume_sig} (Speed={get_bot_speed_multiplier():.2f}x Preserved)")
+            if bot_mode == "5" and runtime_state["id_timer_start"] is not None:
+                runtime_state["id_elapsed_sec"] += max(0.0, time.time() - runtime_state["id_timer_start"])
+                runtime_state["id_timer_start"] = time.time()
+
+            ensure_return_to_home_page_a14()
+            zoom_out_village_a14(passes=2, reason="RESUME HOME ZOOM-OUT")
+            human_sleep(0.6, 0.10)
+            print(f" [RESUMED ON HOME PAGE] Continuing ID #{runtime_state['current_id']} | Phase: {runtime_state['phase']} | Attacks Done: {runtime_state['attacks_done']} | Speed: {get_bot_speed_multiplier():.2f}x")
+            continue
+
+        except KeyboardInterrupt:
+            print("\n[!] Bot ko manually roka gaya (Ctrl+C). Generating Final Previous Progress Report...")
+            print_previous_progress_report(report_stage="STOPPED / COMPLETED (FINAL SESSION REPORT)")
+            break
+
+        except Exception as e:
+            consecutive_loop_errors += 1
+            record_stat("stuck_recoveries", 1)
+            print("\n==================================================")
+            print(f"[! CRITICAL ERROR #{consecutive_loop_errors} !] Main Loop me error aayi:")
+            print(f"-> Reason: {str(e)}")
+            traceback.print_exc()
+            print("==================================================")
+            print("Recovering in 2.5 seconds...")
+            time.sleep(2.5)
+            ensure_return_to_home_page_a14()
+            zoom_out_village_a14(passes=2, reason="ERROR RECOVERY ZOOM-OUT")
+
+            if consecutive_loop_errors >= 5 and bot_mode in ["4", "5", "6", "8", "9"] and total_ids > 1:
+                next_id = (runtime_state["current_id"] % total_ids) + 1
+                print(f" [🛡 NIGHT WATCHDOG] 5 consecutive errors on ID #{runtime_state['current_id']}! Switching to ID #{next_id}...")
+                switch_to_target_id(next_id, total_ids, current_id_index=runtime_state["current_id"])
+                runtime_state["current_id"] = next_id
+                runtime_state["phase"] = "START_CYCLE"
+                runtime_state["attacks_done"] = 0
+                runtime_state["custom_round_idx"] = 1
+                consecutive_loop_errors = 0
+
+if __name__ == "__main__":
+    main_loop()
+EOF
+
+echo "✔ Bot v7 - All 4 Parts (bot_tools.py, bot_upgrade.py, bot_id_switch.py, bot_attack.py & main_bot.py) 100% Updated & Ready!"
 
