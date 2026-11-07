@@ -1,0 +1,1492 @@
+rm -rf __pycache__ *.pyc
+cat << 'EOF' > bot_tools.py
+import sys
+import os
+import io
+import gc
+import time
+import datetime
+import subprocess
+import random
+import re
+import threading
+import select
+
+# Single-thread Tesseract lock to prevent CPU contention & phone heating/lag
+os.environ["OMP_THREAD_LIMIT"] = "1"
+
+from PIL import Image, ImageOps
+import pytesseract
+
+class RestartLoopException(Exception):
+    """Raised when bot detects Home Page or Wrong Button during Attack."""
+    pass
+
+class BotPausedResumeHomeException(Exception):
+    """Raised when bot is paused via 'ZX' and resumed via 'QW' to restart cleanly from Home Page."""
+    pass
+
+# ==========================================
+# 0A. ROOT-LEVEL GAME SPEED-UP ENGINE (1.00x TO 2.25x)
+# ==========================================
+BOT_SPEED_MULTIPLIER = 1.0
+
+SPEED_PRESETS = {
+    "A": 1.00, "B": 1.10, "C": 1.15, "D": 1.20, "E": 1.25,
+    "F": 1.30, "G": 1.35, "H": 1.40, "I": 1.45, "J": 1.50,
+    "K": 1.55, "L": 1.60, "M": 1.65, "N": 1.70, "O": 1.75,
+    "P": 1.80, "Q": 1.85, "R": 1.90, "S": 1.95, "T": 2.00,
+    "U": 2.05, "V": 2.10, "W": 2.15, "X": 2.20, "Y": 2.25
+}
+
+def set_bot_speed_multiplier(mult):
+    """Sets the global bot speed multiplier (1.00x standard up to 2.25x max). Persists across ZX/QW."""
+    global BOT_SPEED_MULTIPLIER
+    val = max(1.0, min(2.25, float(mult)))
+    BOT_SPEED_MULTIPLIER = round(val, 2)
+    print(f" [SPEED ENGINE] Root-Level Bot Speed Multiplier set to: {BOT_SPEED_MULTIPLIER:.2f}x")
+    return BOT_SPEED_MULTIPLIER
+
+def get_bot_speed_multiplier():
+    return BOT_SPEED_MULTIPLIER
+
+def scale_time_by_speed(seconds, min_floor=0.08):
+    """
+    Scales wait/delay durations inversely by BOT_SPEED_MULTIPLIER at root level,
+    while enforcing a mandatory safe hardware floor (0.08s default) so that even at 2.0x-2.25x
+    no button click or game transition ever fails!
+    """
+    raw = float(seconds)
+    if raw <= 0.0:
+        return 0.0
+    if BOT_SPEED_MULTIPLIER <= 1.0:
+        return max(min_floor, raw)
+    scaled = raw / BOT_SPEED_MULTIPLIER
+    return max(min_floor, scaled)
+
+# ==========================================
+# 0B. PREVIOUS PROGRESS REPORT, AVERAGE TIMERS & PIE CHART ENGINE
+# ==========================================
+_REPORT_LOCK = threading.Lock()
+
+def _create_fresh_session_stats():
+    now_ts = time.time()
+    now_dt = datetime.datetime.now().strftime("%d %b %Y, %I:%M:%S %p")
+    return {
+        "session_start_ts": now_ts,
+        "session_start_str": now_dt,
+        "operating_mode_str": "Not Selected",
+        "pause_count": 0,
+        "resume_count": 0,
+        "total_paused_sec": 0.0,
+        "current_pause_start_ts": None,
+        "active_id_index": 1,
+        "active_id_name": "ID #1",
+        "id_switches": 0,
+        "attacks_success": 0,
+        "attacks_failed": 0,
+        "buildings_upgraded": 0,
+        "walls_upgraded": 0,
+        "wrong_buttons_cut": 0,
+        "clan_chat_closed": 0,
+        "daily_rewards_claimed": 0,
+        "welcome_chief_closed": 0,
+        "maintenance_breaks": 0,
+        "stuck_recoveries": 0,
+        "zoom_outs_done": 0,
+        "attack_time_total": 0.0,
+        "attack_time_count": 0,
+        "upgrade_time_total": 0.0,
+        "upgrade_time_count": 0,
+        "id_switch_time_total": 0.0,
+        "id_switch_time_count": 0,
+        "per_id": {}
+    }
+
+SESSION_STATS = _create_fresh_session_stats()
+
+def reset_session_progress_report(mode_label="Active Mode"):
+    global SESSION_STATS
+    with _REPORT_LOCK:
+        SESSION_STATS = _create_fresh_session_stats()
+        SESSION_STATS["operating_mode_str"] = mode_label
+
+def _ensure_id_entry_unlocked(id_idx, id_name=None):
+    key = str(id_idx)
+    if key not in SESSION_STATS["per_id"]:
+        role = "MAIN ID" if int(id_idx) <= 4 else "SECONDARY ID"
+        SESSION_STATS["per_id"][key] = {
+            "id_index": int(id_idx),
+            "name": id_name if id_name else f"ID #{id_idx}",
+            "role": role,
+            "visits": 1,
+            "attacks_ok": 0,
+            "attacks_fail": 0,
+            "buildings": 0,
+            "walls": 0
+        }
+    elif id_name and id_name != f"ID #{id_idx}":
+        SESSION_STATS["per_id"][key]["name"] = id_name
+    return SESSION_STATS["per_id"][key]
+
+def set_report_active_id(id_idx, id_name=None, is_switch=False):
+    with _REPORT_LOCK:
+        SESSION_STATS["active_id_index"] = int(id_idx)
+        if id_name:
+            SESSION_STATS["active_id_name"] = str(id_name)
+        entry = _ensure_id_entry_unlocked(id_idx, id_name)
+        if is_switch:
+            SESSION_STATS["id_switches"] += 1
+            entry["visits"] += 1
+
+def record_stat(event_key, amount=1, id_idx=None):
+    with _REPORT_LOCK:
+        target_id = id_idx if id_idx is not None else SESSION_STATS["active_id_index"]
+        entry = _ensure_id_entry_unlocked(target_id)
+        if event_key in SESSION_STATS:
+            SESSION_STATS[event_key] += amount
+        if event_key == "attacks_success":
+            entry["attacks_ok"] += amount
+        elif event_key == "attacks_failed":
+            entry["attacks_fail"] += amount
+        elif event_key == "buildings_upgraded":
+            entry["buildings"] += amount
+        elif event_key == "walls_upgraded":
+            entry["walls"] += amount
+
+def record_duration(category, duration_sec):
+    dur = max(0.0, float(duration_sec))
+    with _REPORT_LOCK:
+        if category == "attack":
+            SESSION_STATS["attack_time_total"] += dur
+            SESSION_STATS["attack_time_count"] += 1
+        elif category == "upgrade":
+            SESSION_STATS["upgrade_time_total"] += dur
+            SESSION_STATS["upgrade_time_count"] += 1
+        elif category == "id_switch":
+            SESSION_STATS["id_switch_time_total"] += dur
+            SESSION_STATS["id_switch_time_count"] += 1
+
+def _format_duration_hms(total_seconds):
+    total_seconds = max(0, int(round(total_seconds)))
+    hrs = total_seconds // 3600
+    mins = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hrs:02d}h {mins:02d}m {secs:02d}s"
+
+def _make_ascii_bar(value, max_val, width=22, fill_char="█", empty_char="░"):
+    if max_val <= 0 or value <= 0:
+        return empty_char * width
+    filled = int(round((float(value) / float(max_val)) * width))
+    filled = max(1, min(width, filled))
+    return (fill_char * filled) + (empty_char * (width - filled))
+
+def _make_segmented_pie_bar(segments, total_width=40):
+    total_val = sum(val for _, val, _ in segments)
+    if total_val <= 0:
+        return "░" * total_width
+    out = ""
+    used_w = 0
+    for idx, (label, val, color_code) in enumerate(segments):
+        if val <= 0:
+            continue
+        w = int(round((float(val) / float(total_val)) * total_width))
+        if idx == len(segments) - 1 or (used_w + w) > total_width:
+            w = max(0, total_width - used_w)
+        out += f"{color_code}{'█' * w}\033[0m"
+        used_w += w
+    if used_w < total_width:
+        out += "░" * (total_width - used_w)
+    return out
+
+def print_previous_progress_report(report_stage="PAUSED / STOPPED"):
+    with _REPORT_LOCK:
+        now_ts = time.time()
+        now_dt_str = datetime.datetime.now().strftime("%d %b %Y, %I:%M:%S %p")
+        start_ts = SESSION_STATS["session_start_ts"]
+        start_str = SESSION_STATS["session_start_str"]
+
+        total_elapsed = max(0.0, now_ts - start_ts)
+        paused_so_far = SESSION_STATS["total_paused_sec"]
+        if SESSION_STATS["current_pause_start_ts"] is not None:
+            paused_so_far += max(0.0, now_ts - SESSION_STATS["current_pause_start_ts"])
+        active_elapsed = max(0.0, total_elapsed - paused_so_far)
+
+        C_RST = "\033[0m"
+        C_BOLD = "\033[1m"
+        C_CYN = "\033[96m"
+        C_GRN = "\033[92m"
+        C_YLW = "\033[93m"
+        C_MAG = "\033[95m"
+        C_RED = "\033[91m"
+        C_BLU = "\033[94m"
+        C_WHT = "\033[97m"
+
+        atk_ok = SESSION_STATS["attacks_success"]
+        atk_fail = SESSION_STATS["attacks_failed"]
+        atk_total = atk_ok + atk_fail
+        atk_rate = (atk_ok / float(atk_total) * 100.0) if atk_total > 0 else 100.0
+        fail_rate = 100.0 - atk_rate
+
+        bld_up = SESSION_STATS["buildings_upgraded"]
+        wall_up = SESSION_STATS["walls_upgraded"]
+        total_up = bld_up + wall_up
+
+        atk_cnt = SESSION_STATS["attack_time_count"]
+        atk_t_tot = SESSION_STATS["attack_time_total"]
+        avg_atk_s = (atk_t_tot / float(atk_cnt)) if atk_cnt > 0 else 0.0
+
+        upg_cnt = SESSION_STATS["upgrade_time_count"]
+        upg_t_tot = SESSION_STATS["upgrade_time_total"]
+        avg_upg_s = (upg_t_tot / float(upg_cnt)) if upg_cnt > 0 else 0.0
+
+        sw_cnt = SESSION_STATS["id_switch_time_count"]
+        sw_t_tot = SESSION_STATS["id_switch_time_total"]
+        avg_sw_s = (sw_t_tot / float(sw_cnt)) if sw_cnt > 0 else 0.0
+
+        other_active_t = max(0.0, active_elapsed - (atk_t_tot + upg_t_tot + sw_t_tot))
+        denom_active = max(1.0, active_elapsed)
+        pct_atk = min(100.0, (atk_t_tot / denom_active) * 100.0)
+        pct_upg = min(100.0, (upg_t_tot / denom_active) * 100.0)
+        pct_sw = min(100.0, (sw_t_tot / denom_active) * 100.0)
+        pct_oth = max(0.0, 100.0 - (pct_atk + pct_upg + pct_sw))
+
+        print(f"\n{C_CYN}{C_BOLD}╔══════════════════════════════════════════════════════════════════════════════╗{C_RST}")
+        print(f"{C_CYN}{C_BOLD}║                  📊  PREVIOUS PROGRESS REPORT (BOT v8)  📊                   ║{C_RST}")
+        print(f"{C_CYN}{C_BOLD}╠══════════════════════════════════════════════════════════════════════════════╣{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_YLW}Report Status    :{C_RST} {C_BOLD}{C_GRN}{report_stage:<57}{C_RST}{C_CYN}║{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_YLW}Bot Mode & Speed :{C_RST} {C_WHT}{SESSION_STATS['operating_mode_str']} (Speed: {BOT_SPEED_MULTIPLIER:.2f}x){C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_YLW}Start Date & Time:{C_RST} {C_WHT}{start_str:<57}{C_RST}{C_CYN}║{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_YLW}End/Pause Time   :{C_RST} {C_WHT}{now_dt_str:<57}{C_RST}{C_CYN}║{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_YLW}Total Time Gap   :{C_RST} {C_BOLD}{C_CYN}{_format_duration_hms(total_elapsed)}{C_RST}  (Active: {C_GRN}{_format_duration_hms(active_elapsed)}{C_RST} | Paused: {C_MAG}{_format_duration_hms(paused_so_far)}{C_RST})")
+        print(f"{C_CYN}║{C_RST} {C_YLW}Pause/Resume Cnt :{C_RST} Paused: {C_MAG}{SESSION_STATS['pause_count']}x{C_RST} | Resumed: {C_GRN}{SESSION_STATS['resume_count']}x{C_RST} | Home Zoom-Outs: {C_CYN}{SESSION_STATS['zoom_outs_done']}x{C_RST}")
+        print(f"{C_CYN}{C_BOLD}╠══════════════════════════════════════════════════════════════════════════════╣{C_RST}")
+        print(f"{C_CYN}{C_BOLD}║              ⏱️  AVERAGE TIME CATEGORY & SPEED ANALYTICS  ⏱️                 ║{C_RST}")
+        print(f"{C_CYN}{C_BOLD}╠═════════════════════════╦══════════════════════════╦═════════════════════════╣{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_GRN}⚔ Avg Attack Time     {C_RST} {C_CYN}║{C_RST} {C_YLW}🏰 Avg Upgrade Loop Time{C_RST} {C_CYN}║{C_RST} {C_MAG}🔄 Avg ID Switch Time {C_RST} {C_CYN}║{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_BOLD}{avg_atk_s:>7.1f}s{C_RST} ({atk_cnt:>3} runs)   {C_CYN}║{C_RST} {C_BOLD}{avg_upg_s:>7.1f}s{C_RST} ({upg_cnt:>3} loops)   {C_CYN}║{C_RST} {C_BOLD}{avg_sw_s:>7.1f}s{C_RST} ({sw_cnt:>3} switches) {C_CYN}║{C_RST}")
+        print(f"{C_CYN}{C_BOLD}╠═════════════════════════╩══════════════════════════╩═════════════════════════╣{C_RST}")
+        print(f"{C_CYN}{C_BOLD}║              🏆  COMBINED GRAND TOTALS (ALL IDS SUMMARY)  🏆                 ║{C_RST}")
+        print(f"{C_CYN}{C_BOLD}╠══════════════════════════════════════╦═══════════════════════════════════════╣{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_GRN}✔ Successful Attacks   :{C_RST} {C_BOLD}{atk_ok:>10}{C_RST} {C_CYN}║{C_RST} {C_RED}✖ Unsuccessful/Restart :{C_RST} {C_BOLD}{atk_fail:>11}{C_RST} {C_CYN}║{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_CYN}🔄 Total IDs Switched  :{C_RST} {C_BOLD}{SESSION_STATS['id_switches']:>10}{C_RST} {C_CYN}║{C_RST} {C_YLW}🏰 Buildings Upgraded  :{C_RST} {C_BOLD}{bld_up:>11}{C_RST} {C_CYN}║{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_MAG}🧱 Walls Upgraded      :{C_RST} {C_BOLD}{wall_up:>10}{C_RST} {C_CYN}║{C_RST} {C_GRN}⚡ Combined Upgrades   :{C_RST} {C_BOLD}{total_up:>11}{C_RST} {C_CYN}║{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_YLW}✂ Wrong Buttons Cut    :{C_RST} {C_BOLD}{SESSION_STATS['wrong_buttons_cut']:>10}{C_RST} {C_CYN}║{C_RST} {C_BLU}💬 Clan Chat Closed    :{C_RST} {C_BOLD}{SESSION_STATS['clan_chat_closed']:>11}{C_RST} {C_CYN}║{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_GRN}🎁 Daily Rewards Claim :{C_RST} {C_BOLD}{SESSION_STATS['daily_rewards_claimed']:>10}{C_RST} {C_CYN}║{C_RST} {C_MAG}👋 Welcome Chief Cut   :{C_RST} {C_BOLD}{SESSION_STATS['welcome_chief_closed']:>11}{C_RST} {C_CYN}║{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_RED}🛠 Stuck/Loop Recoveries:{C_RST} {C_BOLD}{SESSION_STATS['stuck_recoveries']:>10}{C_RST} {C_CYN}║{C_RST} {C_YLW}⏳ Maintenance Breaks  :{C_RST} {C_BOLD}{SESSION_STATS['maintenance_breaks']:>11}{C_RST} {C_CYN}║{C_RST}")
+        print(f"{C_CYN}{C_BOLD}╠══════════════════════════════════════╩═══════════════════════════════════════╣{C_RST}")
+        print(f"{C_CYN}{C_BOLD}║            🥧  PIE DISTRIBUTION CHARTS & VISUAL GRAPHS  🥧                   ║{C_RST}")
+        print(f"{C_CYN}{C_BOLD}╠══════════════════════════════════════════════════════════════════════════════╣{C_RST}")
+
+        time_pie_bar = _make_segmented_pie_bar([
+            ("Attack", atk_t_tot, C_GRN),
+            ("Upgrade", upg_t_tot, C_YLW),
+            ("ID Switch", sw_t_tot, C_MAG),
+            ("Other", other_active_t, C_BLU)
+        ], total_width=44)
+        print(f"{C_CYN}║{C_RST} {C_BOLD}Time Share Pie :{C_RST} [{time_pie_bar}]")
+        print(f"{C_CYN}║{C_RST}   ├─ {C_GRN}█ Attack Time  : {pct_atk:5.1f}% ({_format_duration_hms(atk_t_tot)}){C_RST}   ├─ {C_YLW}█ Upgrade Time : {pct_upg:5.1f}% ({_format_duration_hms(upg_t_tot)}){C_RST}")
+        print(f"{C_CYN}║{C_RST}   └─ {C_MAG}█ ID Switch    : {pct_sw:5.1f}% ({_format_duration_hms(sw_t_tot)}){C_RST}   └─ {C_BLU}█ Home/Checks  : {pct_oth:5.1f}% ({_format_duration_hms(other_active_t)}){C_RST}")
+
+        atk_pie_bar = _make_segmented_pie_bar([
+            ("Success", atk_ok, C_GRN),
+            ("Restart/Fail", atk_fail, C_RED)
+        ], total_width=44)
+        print(f"{C_CYN}║{C_RST} {C_BOLD}Attack Pie     :{C_RST} [{atk_pie_bar}]")
+        print(f"{C_CYN}║{C_RST}   ├─ {C_GRN}█ Success Ratio: {atk_rate:5.1f}% ({atk_ok} OK){C_RST}         └─ {C_RED}█ Retry/Fail   : {fail_rate:5.1f}% ({atk_fail} Retry){C_RST}")
+
+        up_max = max(1, bld_up, wall_up)
+        bld_bar = _make_ascii_bar(bld_up, up_max, width=26)
+        wal_bar = _make_ascii_bar(wall_up, up_max, width=26)
+        print(f"{C_CYN}║{C_RST} Building Upgrd : [{C_YLW}{bld_bar}{C_RST}] {C_BOLD}{bld_up:>5}{C_RST} Buildings")
+        print(f"{C_CYN}║{C_RST} Wall Upgrades  : [{C_MAG}{wal_bar}{C_RST}] {C_BOLD}{wall_up:>5}{C_RST} Walls")
+
+        print(f"{C_CYN}{C_BOLD}╠══════════════════════════════════════════════════════════════════════════════╣{C_RST}")
+        print(f"{C_CYN}{C_BOLD}║          📋  PER-ID DETAILED BREAKDOWN (NAME, ATTACKS & UPGRADES)  📋        ║{C_RST}")
+        print(f"{C_CYN}{C_BOLD}╠══════╦══════════════════════╦══════════╦════════╦════════╦═════════╦═════════╣{C_RST}")
+        print(f"{C_CYN}║{C_RST} {C_BOLD}ID #{C_RST} {C_CYN}║{C_RST} {C_BOLD}Unique ID / Name    {C_RST} {C_CYN}║{C_RST} {C_BOLD}Role    {C_RST} {C_CYN}║{C_RST} {C_GRN}{C_BOLD}Atk OK{C_RST} {C_CYN}║{C_RST} {C_RED}{C_BOLD}Retry {C_RST} {C_CYN}║{C_RST} {C_YLW}{C_BOLD}Bld Up {C_RST} {C_CYN}║{C_RST} {C_MAG}{C_BOLD}Wall Up{C_RST} {C_CYN}║{C_RST}")
+        print(f"{C_CYN}{C_BOLD}╠══════╬══════════════════════╬══════════╬════════╬════════╬═════════╬═════════╣{C_RST}")
+
+        sorted_keys = sorted(SESSION_STATS["per_id"].keys(), key=lambda x: int(x))
+        if not sorted_keys:
+            print(f"{C_CYN}║{C_RST}  --  {C_CYN}║{C_RST} No ID activity yet   {C_CYN}║{C_RST}    --    {C_CYN}║{C_RST}      0 {C_CYN}║{C_RST}      0 {C_CYN}║{C_RST}       0 {C_CYN}║{C_RST}       0 {C_CYN}║{C_RST}")
+        else:
+            max_id_atk = max([1] + [SESSION_STATS["per_id"][k]["attacks_ok"] for k in sorted_keys])
+            for k in sorted_keys:
+                info = SESSION_STATS["per_id"][k]
+                idx_str = f"#{info['id_index']}"
+                uname = (info["name"] or f"ID #{info['id_index']}")[:20]
+                role_s = "MAIN" if info["id_index"] <= 4 else "SECOND"
+                a_ok = info["attacks_ok"]
+                a_fl = info["attacks_fail"]
+                b_u = info["buildings"]
+                w_u = info["walls"]
+                print(f"{C_CYN}║{C_RST} {C_BOLD}{idx_str:<4}{C_RST} {C_CYN}║{C_RST} {C_WHT}{uname:<20}{C_RST} {C_CYN}║{C_RST} {role_s:<8} {C_CYN}║{C_RST} {C_GRN}{a_ok:>6}{C_RST} {C_CYN}║{C_RST} {C_RED}{a_fl:>6}{C_RST} {C_CYN}║{C_RST} {C_YLW}{b_u:>7}{C_RST} {C_CYN}║{C_RST} {C_MAG}{w_u:>7}{C_RST} {C_CYN}║{C_RST}")
+
+            print(f"{C_CYN}{C_BOLD}╠══════╩══════════════════════╩══════════╩════════╩════════╩═════════╩═════════╣{C_RST}")
+            print(f"{C_CYN}{C_BOLD}║                        📊  PER-ID ATTACK GRAPH  📊                           ║{C_RST}")
+            for k in sorted_keys:
+                info = SESSION_STATS["per_id"][k]
+                uname = (info["name"] or f"ID #{info['id_index']}")[:14]
+                bar_s = _make_ascii_bar(info["attacks_ok"], max_id_atk, width=18)
+                print(f"{C_CYN}║{C_RST} ID #{info['id_index']:<2} ({uname:<14}) [{C_GRN}{bar_s}{C_RST}] {C_BOLD}{info['attacks_ok']}{C_RST} Atk | {C_YLW}{info['buildings']}B{C_RST}/{C_MAG}{info['walls']}W{C_RST}")
+
+        print(f"{C_CYN}{C_BOLD}╚══════════════════════════════════════════════════════════════════════════════╝{C_RST}\n")
+
+# ==========================================
+# 0C. LIVE PAUSE ('ZX') & RESUME ('QW') ENGINE
+# ==========================================
+_PAUSE_STATE = {
+    "paused": False,
+    "resumed_just_now": False,
+    "buffer": "",
+    "listener_started": False
+}
+_PAUSE_LOCK = threading.Lock()
+
+def _trigger_pause_state():
+    with _REPORT_LOCK:
+        SESSION_STATS["pause_count"] += 1
+        SESSION_STATS["current_pause_start_ts"] = time.time()
+    print("\n======================================================================")
+    print(f"|| [BOT PAUSED BY 'ZX'] Bot wahin ruk gaya hai (Speed={BOT_SPEED_MULTIPLIER:.2f}x Safe)! ||")
+    print("|| Dubara Home Page se Resume karne ke liye 'QW' type karein...      ||")
+    print("======================================================================")
+    print_previous_progress_report(report_stage="PAUSED BY 'ZX' (LIVE SNAPSHOT)")
+
+def _trigger_resume_state():
+    global LAST_HOME_CLEANUP_TIME
+    with _REPORT_LOCK:
+        SESSION_STATS["resume_count"] += 1
+        if SESSION_STATS["current_pause_start_ts"] is not None:
+            SESSION_STATS["total_paused_sec"] += max(0.0, time.time() - SESSION_STATS["current_pause_start_ts"])
+            SESSION_STATS["current_pause_start_ts"] = None
+    LAST_HOME_CLEANUP_TIME = 0.0
+    print("\n======================================================================")
+    print(f"|| [BOT RESUMED BY 'QW'] Home Page se wapas start (Speed={BOT_SPEED_MULTIPLIER:.2f}x)! ||")
+    print("======================================================================\n")
+
+def _keyboard_listener_worker():
+    try:
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        use_cbreak = True
+    except Exception:
+        use_cbreak = False
+
+    try:
+        while True:
+            if use_cbreak:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.15)
+                if rlist:
+                    ch = sys.stdin.read(1)
+                    if not ch:
+                        time.sleep(0.1)
+                        continue
+                    do_pause = False
+                    do_resume = False
+                    with _PAUSE_LOCK:
+                        _PAUSE_STATE["buffer"] = (_PAUSE_STATE["buffer"] + ch.lower())[-12:]
+                        buf = _PAUSE_STATE["buffer"]
+                        if not _PAUSE_STATE["paused"] and "zx" in buf:
+                            _PAUSE_STATE["paused"] = True
+                            _PAUSE_STATE["buffer"] = ""
+                            do_pause = True
+                        elif _PAUSE_STATE["paused"] and "qw" in buf:
+                            _PAUSE_STATE["paused"] = False
+                            _PAUSE_STATE["resumed_just_now"] = True
+                            _PAUSE_STATE["buffer"] = ""
+                            do_resume = True
+                    if do_pause:
+                        _trigger_pause_state()
+                    elif do_resume:
+                        _trigger_resume_state()
+            else:
+                line = sys.stdin.readline()
+                if not line:
+                    time.sleep(0.2)
+                    continue
+                clean_line = line.strip().lower()
+                do_pause = False
+                do_resume = False
+                with _PAUSE_LOCK:
+                    if not _PAUSE_STATE["paused"] and "zx" in clean_line:
+                        _PAUSE_STATE["paused"] = True
+                        do_pause = True
+                    elif _PAUSE_STATE["paused"] and "qw" in clean_line:
+                        _PAUSE_STATE["paused"] = False
+                        _PAUSE_STATE["resumed_just_now"] = True
+                        do_resume = True
+                if do_pause:
+                    _trigger_pause_state()
+                elif do_resume:
+                    _trigger_resume_state()
+    except Exception:
+        pass
+    finally:
+        if use_cbreak:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
+def start_pause_resume_listener():
+    with _PAUSE_LOCK:
+        if _PAUSE_STATE["listener_started"]:
+            return
+        _PAUSE_STATE["listener_started"] = True
+    t = threading.Thread(target=_keyboard_listener_worker, daemon=True)
+    t.start()
+
+def check_pause_point(allow_raise=True):
+    was_paused = False
+    while True:
+        with _PAUSE_LOCK:
+            is_paused = _PAUSE_STATE["paused"]
+            resumed_flag = _PAUSE_STATE["resumed_just_now"]
+        if is_paused:
+            was_paused = True
+            time.sleep(0.20)
+            continue
+        if was_paused or resumed_flag:
+            with _PAUSE_LOCK:
+                _PAUSE_STATE["resumed_just_now"] = False
+            if allow_raise:
+                raise BotPausedResumeHomeException("Resumed via QW -> Resetting to Home Page")
+        break
+
+def smart_sleep(seconds, apply_speed=True, min_floor=0.08):
+    raw_sec = max(0.0, float(seconds))
+    if raw_sec <= 0.0:
+        check_pause_point(allow_raise=True)
+        return
+    dur = scale_time_by_speed(raw_sec, min_floor=min_floor) if apply_speed else raw_sec
+    end_time = time.time() + dur
+    while time.time() < end_time:
+        check_pause_point(allow_raise=True)
+        rem = end_time - time.time()
+        if rem <= 0:
+            break
+        time.sleep(min(0.18, rem))
+        check_pause_point(allow_raise=True)
+
+# ==========================================
+# 1. WRONG BUTTON, CLAN CHAT, WELCOME CHIEF, DAILY REWARD & MAINTENANCE COORDS
+# ==========================================
+WRONG_BUTTON_CUT_COORDS = [
+    ("Profile Section", 1917, 87),
+    ("League Page", 2149, 84),
+    ("Clan War", 192, 981),
+    ("Season Reward", 2290, 83),
+    ("Events", 1820, 76),
+    ("News Letter", 2283, 89),
+    ("News", 2284, 73),
+    ("Tournament Hub", 1831, 73),
+    ("Magic Items", 1720, 164),
+    ("Shop", 2282, 79)
+]
+
+# Clan Chat Box Drawer Coordinates (792, 423 to 863, 457)
+CLAN_CHAT_DRAWER_BOX = (792, 423, 863, 457)
+CLAN_CHAT_CLICK_COORD = (827, 440)
+
+# Welcome Back Chief Coordinates
+WELCOME_CHIEF_RED_BANNER_BOX = (1549, 103, 1844, 164)
+WELCOME_CHIEF_GREEN_BTN_BOX = (1142, 924, 1312, 940)
+WELCOME_CHIEF_CLICK_COORD = (1227, 932)
+
+# Daily Reward Popup Coordinates (458, 113 to 1921, 930)
+DAILY_REWARD_OUTER_BOX = (458, 113, 1921, 930)
+DAILY_REWARD_CLOSE_BTN = (1858, 153)
+DAILY_REWARD_GREEN_BOXES = [
+    (540, 467, 753, 490),
+    (839, 467, 1042, 487),
+    (1131, 468, 1332, 488),
+    (537, 782, 744, 805),
+    (844, 786, 1033, 804),
+    (1136, 791, 1346, 812),
+    (1435, 782, 1731, 813)
+]
+
+# Maintenance Break Coordinates
+MAINTENANCE_BREAK_BOX = (979, 16, 1442, 63)
+MAINTENANCE_CLICK_COORD = (1210, 39)
+MAINTENANCE_REST_SEC = 600.0
+
+# Green box with white '+' check on Home Page
+HOME_PAGE_CHECK_COORDS = [(2050, 285), (2050, 250)]
+
+# Storage Bars & Check Boxes
+GOLD_STORAGE_BAR = (2170, 63)
+ELIXIR_STORAGE_BAR = (2166, 128)
+GOLD_STORAGE_CHECK_BOX = (2015, 43, 2081, 78)
+ELIXIR_STORAGE_CHECK_BOX = (2003, 116, 2103, 151)
+
+WALL_GOLD_STORAGE_CHECK_BOX = (1947, 44, 2015, 76)
+WALL_ELIXIR_STORAGE_CHECK_BOX = (1947, 115, 2015, 149)
+
+# ==========================================
+# 2. UPGRADE SYSTEM COORDINATES (SAMSUNG GALAXY A14)
+# ==========================================
+ENABLE_CONDITION_2 = True
+
+UPGRADE_A14 = {
+    "BUILD_CLICK": (2233, 948),
+    "BUILDER_CHECK_BOX": (1754, 1008, 1847, 1038),
+    "UPGRADE_LIST_BOX": (1820, 545, 2312, 926),
+    "CLOSE_MENU": (2322, 45),
+
+    "C1_CLICK_1": (1780, 46),
+    "C1_CLICK_2": (1392, 707),
+    "C1_CLICK_3": (2048, 54),
+    "SCROLL_START": (2050, 863),
+    "SCROLL_END": (2050, 542),
+    "C1_CONFIRM_CLICK": (1582, 930),
+    "C1_WRONG_BTN": (1589, 339),
+    "C1_REOPEN_LIST": (2050, 56),
+
+    "WALL_STEP_A1_CLICK": (439, 851),
+    "WALL_NAME_CHECK_BOX": (1018, 45, 1400, 108),
+    "WALL_REOPEN_LIST_CLICK": (2062, 54),
+    "WALL_CONFIRM_CLICK": (1595, 942),
+
+    "C2_STEP_1": (960, 845),
+    "C2_STEP_2": (1580, 930),
+    "C2_RED_X": (1590, 326),
+    "C2_RED_X_NEXT": (2065, 51),
+    "C2_RED_X_ALT_1": (1162, 841),
+    "C2_RED_X_ALT_2": (1587, 928),
+    "C2_NO_RED_ALT_1": (1172, 835),
+    "C2_NO_RED_ALT_2": (1586, 927),
+    "C2_FOUR_CLICK": (2080, 50)
+}
+
+CARD_GEOMETRY = {
+    "CARD_X1": 1820,
+    "CARD_X2": 2312,
+    "CARD_HEIGHT": 81,
+    "NAME_X1": 1823,
+    "NAME_X2": 2124,
+    "NAME_DY1": 5,
+    "NAME_DY2": 41,
+    "TIME_X1": 2241,
+    "TIME_X2": 2310,
+    "TIME_DY1": 2,
+    "TIME_DY2": 35,
+    # Restricted COST_X2 to 2252 (digits only) so resource icons at 2260..2313 never cause false WHITE!
+    "COST_X1": 2108,
+    "COST_X2": 2252,
+    "COST_DY1": 33,
+    "COST_DY2": 78
+}
+
+CONDITION_1_EXCLUDED = [
+    "town hall", "townhall",
+    "barbarian", "king",
+    "dragon duke", "duke",
+    "minion prince", "prince",
+    "crafting", "station",
+    "royal", "champion",
+    "archer queen", "queen",
+    "grand warden", "warden",
+    "wall"
+]
+
+KNOWN_BUILDINGS = [
+    "eagle artillery", "scattershot", "inferno tower", "x-bow", "xbow",
+    "monolith", "spell tower", "firespitter", "ricochet cannon", "multi-archer tower",
+    "multi-gear tower", "air defense", "wizard tower", "hidden tesla", "tesla",
+    "bomb tower", "mortar", "archer tower", "cannon", "air sweeper", "builder's hut",
+    "builder hut", "clan castle", "laboratory", "spell factory", "dark spell factory",
+    "barracks", "dark barracks", "workshop", "pet house", "blacksmith", "hero hall",
+    "army camp", "gold storage", "elixir storage", "dark elixir storage",
+    "gold mine", "elixir collector", "dark elixir drill", "helper hut", "revenge tower",
+    "giant bomb", "air bomb", "seeking air mine", "skeleton trap", "tornado trap",
+    "spring trap", "bomb", "giga bomb"
+]
+
+# ==========================================
+# 3. FAST ATTACK 1 (1 MIN) COORDINATES (A14)
+# ==========================================
+FAST_ATTACK = {
+    "BATTLE_BTN": (182, 961),
+    "FIND_MATCH_BTN": (364, 808),
+    "ATTACK_BTN": (1980, 972),
+
+    "SPELL_SELECT": (1527, 983),
+    "SPELL_DEPLOY_LIST": [
+        (378, 469), (594, 350), (566, 569), (691, 461),
+        (864, 278), (812, 760), (928, 569), (915, 444),
+        (1170, 580), (1070, 250), (892, 815)
+    ],
+
+    "ARMY_1_SELECT": (470, 988),
+    "ARMY_1_DEPLOY_LIST": [
+        (325, 525), (225, 510), (303, 473), (292, 592),
+        (222, 516), (453, 363), (337, 611), (256, 512),
+        (375, 524)
+    ],
+
+    "ARMY_2_SELECT": (590, 985),
+    "ARMY_2_DEPLOY_LIST": [
+        (243, 522), (318, 527), (355, 465)
+    ],
+
+    "SIEGE_SELECT": (770, 977),
+    # Siege Machine uses ONLY 4 safe deploy coordinates so it is never over-tapped or popped!
+    "SIEGE_DEPLOY_LIST": [
+        (325, 525), (225, 510), (303, 473), (292, 592)
+    ],
+    "HERO_1_SELECT": (925, 1005),
+    "HERO_2_SELECT": (1073, 987),
+    "HERO_3_SELECT": (1218, 990),
+    "HERO_4_SELECT": (1350, 978),
+
+    "SURRENDER_BTN": (181, 800),
+    "OKAY_BTN": (1419, 701),
+    "RETURN_HOME_BTN": (1222, 918)
+}
+
+# ==========================================
+# 3B. SUPERCELL ID SWITCH SYSTEM COORDINATES
+# ==========================================
+ID_SWITCH_A14 = {
+    "PROFILE_BTN": (142, 122),
+    "SETTINGS_BTN": (1755, 92),
+    "SWITCH_ICON_BTN": (1507, 207),
+    "CLOSE_SWITCH_PANEL_BTN": (135, 80),
+
+    "LIST_BOX_CORNERS": (135, 150, 2370, 1040),
+    "SUPERCELL_LOGO_BOX": (335, 502, 710, 518),
+    "SUPERCELL_LOGO_OCR_BOX": (325, 465, 725, 550),
+    "DIVIDER_X": 1118,
+
+    "FIRST_CARD_BOX": (1158, 209, 2376, 434),
+    "PROFILE_ICON_BOX": (1187, 237, 1340, 386),
+    "UNIQUE_ID_BOX": (1350, 236, 1940, 292),
+    "ID_NAME_BOX": (1190, 300, 1429, 353),
+    "TOWN_HALL_BOX": (1348, 360, 1662, 396),
+    "LEAGUE_BOX": (2162, 265, 2335, 368),
+
+    "CARD_HEIGHT": 225,
+    "CARD_STEP_Y": 242,
+    "UNIQUE_ID_REL_Y1": 27,
+    "UNIQUE_ID_REL_Y2": 83,
+    "ID_NAME_REL_Y1": 91,
+    "ID_NAME_REL_Y2": 144,
+    "TH_REL_Y1": 151,
+    "TH_REL_Y2": 187,
+
+    "ID_1_CLICK": (1763, 321),
+    "ID_2_CLICK": (1763, 563),
+    "ID_3_CLICK": (1763, 800),
+    "ID_4_CLICK": (1763, 1044),
+    "ID_SLOTS": [
+        (1763, 321),
+        (1763, 563),
+        (1763, 800),
+        (1763, 1044)
+    ],
+
+    "SCROLL_START": (1763, 1030),
+    "SCROLL_END": (1763, 215),
+    "SCROLL_DURATION_MS": 1050,
+
+    "ID_INITIAL_WAIT_SEC": 3.5,
+    "ID_POLL_INTERVAL_SEC": 1.0,
+    "ID_LOAD_WAIT_SEC": 30.0
+}
+
+# ==========================================
+# 4. PERSISTENT ADB SHELL, SCREENSHOT & HOME-ONLY SYMMETRIC 2-FINGER ZOOM-OUT
+# ==========================================
+_ADB_SHELL_PROC = None
+_ADB_LOCK = threading.Lock()
+_MONKEY_SCRIPT_READY = False
+
+_SCREENSHOT_CACHE = {
+    "img": None,
+    "timestamp": 0.0
+}
+LAST_HOME_CLEANUP_TIME = 0.0
+LAST_DETECTED_BUILDERS = None
+LAST_BUILDER_CHECK_TIME = 0.0
+
+def _invalidate_screen_cache():
+    _SCREENSHOT_CACHE["img"] = None
+    _SCREENSHOT_CACHE["timestamp"] = 0.0
+
+def reset_persistent_adb_shell():
+    global _ADB_SHELL_PROC
+    with _ADB_LOCK:
+        if _ADB_SHELL_PROC is not None:
+            try:
+                _ADB_SHELL_PROC.stdin.close()
+            except Exception:
+                pass
+            try:
+                _ADB_SHELL_PROC.terminate()
+            except Exception:
+                pass
+            _ADB_SHELL_PROC = None
+
+def _exec_adb_shell_cmd(cmd_str):
+    global _ADB_SHELL_PROC
+    _invalidate_screen_cache()
+    with _ADB_LOCK:
+        try:
+            if _ADB_SHELL_PROC is None or _ADB_SHELL_PROC.poll() is not None:
+                _ADB_SHELL_PROC = subprocess.Popen(
+                    ["adb", "shell"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1
+                )
+            _ADB_SHELL_PROC.stdin.write(cmd_str + "\n")
+            _ADB_SHELL_PROC.stdin.flush()
+            return
+        except Exception:
+            _ADB_SHELL_PROC = None
+    try:
+        subprocess.run(["adb", "shell", cmd_str], timeout=5)
+    except Exception:
+        pass
+
+def zoom_out_village_a14(passes=2, reason="HOME PAGE VIEW"):
+    """
+    HOME-PAGE-ONLY SYMMETRIC 2-FINGER PINCH-IN ZOOM-OUT:
+      - NEVER called during Attack / Battlefield!
+      - Uses 100% center-symmetric 2-finger PinchZoom around exact screen center (1200, 540):
+          Finger 1: (400, 200) -> (1100, 500)  [dx = +700, dy = +300]
+          Finger 2: (2000, 880) -> (1300, 580) [dx = -700, dy = -300]
+        Because both fingers move with equal and opposite vectors toward (1200, 540),
+        the village zooms out cleanly without panning/scrolling off-center!
+    """
+    global _MONKEY_SCRIPT_READY
+    check_pause_point(allow_raise=True)
+    _invalidate_screen_cache()
+    print(f" [HOME ZOOM-OUT] Executing Symmetric 2-Finger Pinch-In ({passes}x) on Home Page [{reason}]...")
+
+    try:
+        if not _MONKEY_SCRIPT_READY:
+            mks_content = (
+                "type= raw events\n"
+                "count= 1\n"
+                "speed= 1.0\n"
+                "start data >>\n"
+                "PinchZoom(400,200,1100,500,2000,880,1300,580,18)\n"
+                "UserWait(120)\n"
+                "PinchZoom(400,200,1100,500,2000,880,1300,580,18)\n"
+            )
+            setup_cmd = f"cat << 'EOM' > /data/local/tmp/coc_pinch_out.mks\n{mks_content}EOM\n"
+            subprocess.run(["adb", "shell", setup_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4)
+            _MONKEY_SCRIPT_READY = True
+
+        subprocess.run(
+            ["adb", "shell", "monkey -f /data/local/tmp/coc_pinch_out.mks 1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5
+        )
+    except Exception:
+        _MONKEY_SCRIPT_READY = False
+
+    human_sleep(0.20, 0.03)
+    tap(*GOLD_STORAGE_BAR, delay_range=(0.04, 0.07), jitter=2)
+    record_stat("zoom_outs_done", 1)
+    _invalidate_screen_cache()
+
+def human_sleep(base_sec, variance=0.04, apply_speed=True, min_floor=0.08):
+    check_pause_point(allow_raise=True)
+    raw_t = max(0.02, float(base_sec) + random.uniform(-variance, variance))
+    smart_sleep(raw_t, apply_speed=apply_speed, min_floor=min_floor)
+
+def tap(x, y, delay_range=(0.03, 0.07), jitter=2, check_pause=True, apply_speed=True):
+    if check_pause:
+        check_pause_point(allow_raise=True)
+    jx = int(x) + random.randint(-jitter, jitter)
+    jy = int(y) + random.randint(-jitter, jitter)
+    _exec_adb_shell_cmd(f"input tap {jx} {jy}")
+    if delay_range and delay_range[1] > 0:
+        wait_t = random.uniform(*delay_range)
+        if apply_speed:
+            wait_t = scale_time_by_speed(wait_t, min_floor=0.025)
+        if check_pause:
+            smart_sleep(wait_t, apply_speed=False)
+        else:
+            time.sleep(wait_t)
+
+def fast_serial_taps(coord_list, rounds=1, jitter=2):
+    check_pause_point(allow_raise=True)
+    cmds = []
+    for _ in range(rounds):
+        for (x, y) in coord_list:
+            jx = int(x) + random.randint(-jitter, jitter)
+            jy = int(y) + random.randint(-jitter, jitter)
+            cmds.append(f"input tap {jx} {jy}")
+    if cmds:
+        _exec_adb_shell_cmd("; ".join(cmds))
+
+def batch_tap_sequence(coord_list, inter_delay=0.04, jitter=2):
+    check_pause_point(allow_raise=True)
+    cmds = []
+    scaled_gap = scale_time_by_speed(inter_delay, min_floor=0.025) if inter_delay > 0 else 0.0
+    for idx, (x, y) in enumerate(coord_list):
+        jx = int(x) + random.randint(-jitter, jitter)
+        jy = int(y) + random.randint(-jitter, jitter)
+        cmds.append(f"input tap {jx} {jy}")
+        if scaled_gap >= 0.08 and idx < len(coord_list) - 1:
+            cmds.append(f"sleep {scaled_gap:.2f}")
+    if cmds:
+        _exec_adb_shell_cmd("; ".join(cmds))
+    if 0 < scaled_gap < 0.08:
+        smart_sleep(0.04, apply_speed=False)
+
+def swipe(x1, y1, x2, y2, duration=350, post_sleep=0.38, apply_speed=True):
+    check_pause_point(allow_raise=True)
+    sx1 = int(x1) + random.randint(-3, 3)
+    sy1 = int(y1) + random.randint(-3, 3)
+    sx2 = int(x2) + random.randint(-3, 3)
+    sy2 = int(y2) + random.randint(-3, 3)
+    if apply_speed:
+        scaled_dur = int(max(220, scale_time_by_speed(duration, min_floor=220) + random.randint(-15, 20)))
+    else:
+        scaled_dur = int(max(220, duration + random.randint(-15, 20)))
+    _exec_adb_shell_cmd(f"input swipe {sx1} {sy1} {sx2} {sy2} {scaled_dur}")
+    human_sleep(post_sleep, 0.04, apply_speed=apply_speed, min_floor=0.12)
+
+def get_screenshot(check_pause=True, force_fresh=False):
+    if check_pause:
+        check_pause_point(allow_raise=True)
+
+    now = time.time()
+    if (not force_fresh) and (_SCREENSHOT_CACHE["img"] is not None) and ((now - _SCREENSHOT_CACHE["timestamp"]) <= 0.24):
+        return _SCREENSHOT_CACHE["img"]
+
+    img = None
+    try:
+        proc = subprocess.run(
+            ["adb", "exec-out", "screencap", "-p"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=6
+        )
+        if proc.returncode == 0 and proc.stdout and len(proc.stdout) > 1024:
+            bio = io.BytesIO(proc.stdout)
+            loaded_img = Image.open(bio)
+            loaded_img.load()
+            img = loaded_img.convert("RGB")
+            bio.close()
+    except Exception:
+        img = None
+
+    if img is None:
+        try:
+            subprocess.run("adb exec-out screencap -p > screen.png", shell=True, timeout=6)
+            if os.path.exists("screen.png"):
+                img = Image.open("screen.png").convert("RGB")
+        except Exception:
+            reset_persistent_adb_shell()
+            if _SCREENSHOT_CACHE["img"] is not None:
+                return _SCREENSHOT_CACHE["img"]
+            img = Image.new("RGB", (2400, 1080), (0, 0, 0))
+
+    _SCREENSHOT_CACHE["img"] = img
+    _SCREENSHOT_CACHE["timestamp"] = time.time()
+    return img
+
+def clean_ram_garbage():
+    _invalidate_screen_cache()
+    reset_persistent_adb_shell()
+    gc.collect()
+
+# ==========================================
+# 5. STRICT POPUP & SCREEN SCANNERS
+# ==========================================
+def is_red_x_box_at(img, cx, cy, radius=10):
+    w, h = img.size
+    px_map = img.load()
+    red_count = 0
+    white_count = 0
+    for dy in range(-radius, radius + 1, 2):
+        for dx in range(-radius, radius + 1, 2):
+            px = min(max(0, cx + dx), w - 1)
+            py = min(max(0, cy + dy), h - 1)
+            r, g, b = px_map[px, py]
+            if r > 182 and g < 72 and b < 72 and (r > g + 115):
+                red_count += 1
+            elif r > 215 and g > 215 and b > 215 and (max(r, g, b) - min(r, g, b) <= 25):
+                white_count += 1
+    return red_count >= 7 and white_count >= 2
+
+def is_on_home_page_a14(img=None):
+    """Checks (2050, 285) and (2050, 250) for the green box with a white '+' sign."""
+    if img is None:
+        img = get_screenshot()
+    w, h = img.size
+    px_map = img.load()
+    for (cx, cy) in HOME_PAGE_CHECK_COORDS:
+        green_pixels = 0
+        white_pixels = 0
+        for dy in range(-12, 13, 2):
+            for dx in range(-12, 13, 2):
+                px = min(max(0, cx + dx), w - 1)
+                py = min(max(0, cy + dy), h - 1)
+                r, g, b = px_map[px, py]
+                if g > 135 and g > r + 25 and g > b + 25:
+                    green_pixels += 1
+                elif r > 210 and g > 210 and b > 210:
+                    white_pixels += 1
+        if green_pixels >= 6 and white_pixels >= 1:
+            return True
+    return False
+
+def check_clan_chat_drawer_a14(img=None, use_build_fallback=False):
+    if img is None:
+        img = get_screenshot()
+    w, h = img.size
+    px_map = img.load()
+    cx1, cy1, cx2, cy2 = CLAN_CHAT_DRAWER_BOX
+
+    orange_px = 0
+    total_px = 0
+    for sy in range(max(0, cy1 + 2), min(h, cy2 - 2), 2):
+        for sx in range(max(0, cx1 + 3), min(w, cx2 - 3), 3):
+            r, g, b = px_map[sx, sy]
+            total_px += 1
+            if r > 195 and (105 <= g <= 205) and b < 75 and (r > g + 25):
+                orange_px += 1
+
+    is_drawer_open = (total_px > 0 and (orange_px / float(total_px)) >= 0.58)
+    if not is_drawer_open and not use_build_fallback:
+        return False
+
+    if is_drawer_open:
+        print(" [!] [CLAN CHAT DRAWER] Open Clan Chat detected at (792,423..863,457)! Clicking (827, 440) to close...")
+        tap(*CLAN_CHAT_CLICK_COORD, delay_range=(0.12, 0.20), jitter=3)
+        human_sleep(0.25, 0.04)
+        record_stat("clan_chat_closed", 1)
+        chk = get_screenshot(force_fresh=True)
+        px2 = chk.load()
+        rem_orange = sum(
+            1 for sy in range(max(0, cy1 + 2), min(h, cy2 - 2), 3)
+            for sx in range(max(0, cx1 + 3), min(w, cx2 - 3), 4)
+            if px2[sx, sy][0] > 195 and (105 <= px2[sx, sy][1] <= 205) and px2[sx, sy][2] < 75
+        )
+        if rem_orange <= 6 and not use_build_fallback:
+            return True
+
+    if use_build_fallback or is_drawer_open:
+        print(" [SAFE IN-GAME RESET] Clicking Build (2233, 948) -> Close (2322, 45) to clear Clan Chat / Center Modal...")
+        tap(*UPGRADE_A14["BUILD_CLICK"], delay_range=(0.18, 0.28), jitter=3)
+        human_sleep(0.38, 0.05)
+        tap(*UPGRADE_A14["CLOSE_MENU"], delay_range=(0.18, 0.28), jitter=3)
+        human_sleep(0.32, 0.05)
+        record_stat("clan_chat_closed", 1)
+        return True
+
+    return False
+
+def check_welcome_back_chief_a14(img=None):
+    if img is None:
+        img = get_screenshot()
+    w, h = img.size
+    px_map = img.load()
+
+    rx1, ry1, rx2, ry2 = WELCOME_CHIEF_RED_BANNER_BOX
+    red_px = 0
+    r_total = 0
+    for sy in range(max(0, ry1 + 2), min(h, ry2 - 2), 3):
+        for sx in range(max(0, rx1 + 4), min(w, rx2 - 4), 5):
+            r, g, b = px_map[sx, sy]
+            r_total += 1
+            if r > 165 and g < 75 and b < 75 and (r > g + 95):
+                red_px += 1
+
+    if r_total == 0 or (red_px / float(r_total)) < 0.60:
+        return False
+
+    gx1, gy1, gx2, gy2 = WELCOME_CHIEF_GREEN_BTN_BOX
+    green_px = 0
+    g_total = 0
+    for sy in range(max(0, gy1 + 1), min(h, gy2 - 1), 2):
+        for sx in range(max(0, gx1 + 4), min(w, gx2 - 4), 4):
+            r, g, b = px_map[sx, sy]
+            g_total += 1
+            if g > 130 and g > (r + 25) and g > (b + 25):
+                green_px += 1
+
+    if g_total == 0 or (green_px / float(g_total)) < 0.55:
+        return False
+
+    print(" [!] [WELCOME BACK CHIEF] Red Banner + Green Button verified! Clicking (1227, 932)...")
+    tap(*WELCOME_CHIEF_CLICK_COORD, delay_range=(0.15, 0.25), jitter=3)
+    human_sleep(0.35, 0.05)
+    record_stat("welcome_chief_closed", 1)
+    return True
+
+def _analyze_daily_reward_slot(px_map, w, h, x1, y1, x2, y2):
+    green_vals = []
+    gray_dark_px = 0
+    total_px = 0
+    for sy in range(max(0, y1 + 3), min(h, y2 - 2), 2):
+        for sx in range(max(0, x1 + 6), min(w, x2 - 5), 4):
+            r, g, b = px_map[sx, sy]
+            total_px += 1
+            if g > 145 and g > (r + 35) and g > (b + 40) and r < 165 and b < 140:
+                green_vals.append(g)
+            elif (45 <= r <= 145) and (45 <= g <= 145) and (45 <= b <= 155) and (max(r, g, b) - min(r, g, b) <= 32):
+                gray_dark_px += 1
+
+    if total_px == 0:
+        return "OTHER", 0.0
+
+    green_ratio = len(green_vals) / float(total_px)
+    if green_ratio >= 0.68 and len(green_vals) >= 12:
+        mean_g = sum(green_vals) / float(len(green_vals))
+        mean_dev = sum(abs(v - mean_g) for v in green_vals) / float(len(green_vals))
+        if mean_dev <= 16.5:
+            return "FLAT_GREEN", green_ratio
+
+    gray_ratio = gray_dark_px / float(total_px)
+    if gray_ratio >= 0.55:
+        return "MODAL_GRAY", gray_ratio
+
+    return "OTHER", 0.0
+
+def check_daily_reward_popup(img=None):
+    if img is None:
+        img = get_screenshot()
+
+    if is_on_home_page_a14(img):
+        return False
+    if is_red_x_box_at(img, *UPGRADE_A14["CLOSE_MENU"], radius=14):
+        return False
+
+    w, h = img.size
+    px_map = img.load()
+
+    close_x, close_y = DAILY_REWARD_CLOSE_BTN
+    has_close_red_x = is_red_x_box_at(img, close_x, close_y, radius=13)
+
+    flat_green_boxes = []
+    modal_gray_count = 0
+
+    for idx, (bx1, by1, bx2, by2) in enumerate(DAILY_REWARD_GREEN_BOXES, start=1):
+        slot_type, _ = _analyze_daily_reward_slot(px_map, w, h, bx1, by1, bx2, by2)
+        if slot_type == "FLAT_GREEN":
+            flat_green_boxes.append((idx, (bx1 + bx2) // 2, (by1 + by2) // 2))
+        elif slot_type == "MODAL_GRAY":
+            modal_gray_count += 1
+
+    is_valid_board = has_close_red_x or (1 <= len(flat_green_boxes) <= 3 and modal_gray_count >= 4)
+    if not is_valid_board:
+        return False
+
+    print(f" [DAILY REWARD VERIFIED] GreenSlots={len(flat_green_boxes)}, GraySiblingSlots={modal_gray_count}, RedX_Before={has_close_red_x}")
+
+    for idx, cx, cy in flat_green_boxes:
+        print(f" [+] [DAILY REWARD] Clicking Green Box #{idx} at ({cx}, {cy})...")
+        tap(cx, cy, delay_range=(0.15, 0.25), jitter=3)
+        human_sleep(0.45, 0.06)
+
+    print(f" [x] [DAILY REWARD] Clicking Top-Right Red 'X' Button ({close_x}, {close_y})...")
+    tap(close_x, close_y, delay_range=(0.15, 0.25), jitter=3)
+    human_sleep(0.30, 0.05)
+    record_stat("daily_rewards_claimed", 1)
+    return True
+
+def check_and_handle_maintenance_break(img=None):
+    if img is None:
+        img = get_screenshot()
+
+    def _is_maintenance_banner_visible(cur_img):
+        w, h = cur_img.size
+        px_map = cur_img.load()
+        mx1, my1, mx2, my2 = MAINTENANCE_BREAK_BOX
+        yellow_px = 0
+        black_px = 0
+        total_px = 0
+        for sy in range(max(0, my1), min(h, my2), 2):
+            for sx in range(max(0, mx1), min(w, mx2), 3):
+                r, g, b = px_map[sx, sy]
+                total_px += 1
+                if r > 185 and g > 145 and b < 95 and (r + g) > (b * 3):
+                    yellow_px += 1
+                elif r < 80 and g < 80 and b < 80:
+                    black_px += 1
+
+        if total_px == 0 or (yellow_px / total_px) < 0.25 or black_px < 12:
+            return False, ""
+
+        crop = cur_img.crop((mx1, my1, mx2, my2))
+        upscaled = crop.resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS)
+        uw, uh = upscaled.size
+        u_src = upscaled.load()
+        bw = Image.new("L", (uw, uh), 255)
+        u_dst = bw.load()
+        for py in range(uh):
+            for px in range(uw):
+                r, g, b = u_src[px, py]
+                if r < 95 and g < 95 and b < 95:
+                    u_dst[px, py] = 0
+        padded = ImageOps.expand(bw, border=12, fill=255)
+        cfg = "--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ "
+        txt = pytesseract.image_to_string(padded, config=cfg).strip().upper()
+        clean_t = re.sub(r"[^A-Z]", "", txt)
+        if "MAINT" in clean_t or "TENANCE" in clean_t or "BREAK" in clean_t:
+            return True, txt
+        return False, txt
+
+    is_maint, read_txt = _is_maintenance_banner_visible(img)
+    if not is_maint:
+        return False
+
+    record_stat("maintenance_breaks", 1)
+    cycle_idx = 1
+    while True:
+        print("\n======================================================================")
+        print(f"|| [MAINTENANCE BREAK VERIFIED] Read: '{read_txt}' at (979,16..1442,63) ||")
+        print(f"|| [REST #{cycle_idx}] Bot 10 Minute (600s) ke rest par ja raha hai...        ||")
+        print("======================================================================\n")
+
+        smart_sleep(MAINTENANCE_REST_SEC, apply_speed=False)
+
+        print(f" [MAINTENANCE CHECK #{cycle_idx}] 10 Min complete! Clicking (1210, 39) 2 times...")
+        tap(*MAINTENANCE_CLICK_COORD, delay_range=(0.15, 0.25), jitter=3, apply_speed=False)
+        tap(*MAINTENANCE_CLICK_COORD, delay_range=(0.15, 0.25), jitter=3, apply_speed=False)
+        smart_sleep(5.0, apply_speed=False)
+
+        chk_img = get_screenshot(force_fresh=True)
+        check_wrong_buttons_a14(chk_img)
+        still_maint, read_txt = _is_maintenance_banner_visible(chk_img)
+        if not still_maint:
+            print(" [✔] [MAINTENANCE OVER] Maintenance Break khatam ho gaya hai! Resuming Bot...")
+            return True
+        cycle_idx += 1
+
+def check_wrong_buttons_a14(img=None, check_clan_chat=False):
+    if img is None:
+        img = get_screenshot()
+    clicked_any = False
+
+    if check_clan_chat:
+        if check_clan_chat_drawer_a14(img, use_build_fallback=False):
+            clicked_any = True
+            img = get_screenshot(force_fresh=True)
+
+    if is_on_home_page_a14(img):
+        return clicked_any
+
+    for label, x, y in WRONG_BUTTON_CUT_COORDS:
+        if is_red_x_box_at(img, x, y, radius=11):
+            print(f" [!] [WRONG BUTTON CUT] '{label}' ({x}, {y}) par Red 'X' mila! Cut kar rahe hain...")
+            tap(x, y, delay_range=(0.10, 0.18), jitter=2)
+            clicked_any = True
+            record_stat("wrong_buttons_cut", 1)
+            human_sleep(0.12, 0.03)
+            img = get_screenshot(force_fresh=True)
+            if is_on_home_page_a14(img):
+                break
+
+    return clicked_any
+
+def check_wrong_and_home_page_a14(img=None, check_clan_chat=False):
+    if img is None:
+        img = get_screenshot()
+
+    if check_clan_chat and check_clan_chat_drawer_a14(img, use_build_fallback=False):
+        img = get_screenshot(force_fresh=True)
+
+    if is_on_home_page_a14(img):
+        return False, True, img
+
+    was_cut = check_wrong_buttons_a14(img, check_clan_chat=False)
+    if was_cut:
+        img = get_screenshot(force_fresh=True)
+    is_home = is_on_home_page_a14(img)
+    return was_cut, is_home, img
+
+def run_zone1_post_id_switch_checks(img=None):
+    if img is None:
+        img = get_screenshot(force_fresh=True)
+
+    if is_on_home_page_a14(img):
+        if check_clan_chat_drawer_a14(img, use_build_fallback=False):
+            img = get_screenshot(force_fresh=True)
+        return False, True, img
+
+    acted = False
+    if check_welcome_back_chief_a14(img):
+        acted = True
+        img = get_screenshot(force_fresh=True)
+
+    if not is_on_home_page_a14(img) and check_daily_reward_popup(img):
+        acted = True
+        img = get_screenshot(force_fresh=True)
+
+    if not is_on_home_page_a14(img) and check_wrong_buttons_a14(img, check_clan_chat=True):
+        acted = True
+        img = get_screenshot(force_fresh=True)
+
+    is_home = is_on_home_page_a14(img)
+    return acted, is_home, img
+
+def run_zone2_home_periodic_checks(img=None):
+    if img is None:
+        img = get_screenshot()
+    check_and_handle_maintenance_break(img)
+    if check_clan_chat_drawer_a14(img, use_build_fallback=False):
+        img = get_screenshot(force_fresh=True)
+    if not is_on_home_page_a14(img):
+        if check_daily_reward_popup(img):
+            img = get_screenshot(force_fresh=True)
+        if check_wrong_buttons_a14(img, check_clan_chat=False):
+            img = get_screenshot(force_fresh=True)
+    return is_on_home_page_a14(img), img
+
+def ensure_return_to_home_page_a14():
+    print(" [*] [HOME RECOVERY] Ensuring bot is cleanly on the Home Page...")
+    for attempt in range(1, 4):
+        img = get_screenshot(check_pause=False, force_fresh=True)
+        check_and_handle_maintenance_break(img)
+
+        if is_on_home_page_a14(img):
+            check_clan_chat_drawer_a14(img, use_build_fallback=False)
+            double_click_storage_bars()
+            return True
+
+        if is_red_x_box_at(img, *UPGRADE_A14["CLOSE_MENU"], radius=14):
+            tap(*UPGRADE_A14["CLOSE_MENU"], delay_range=(0.15, 0.25), jitter=3, check_pause=False)
+            human_sleep(0.32, 0.04, apply_speed=True)
+            continue
+
+        check_welcome_back_chief_a14(img)
+        check_daily_reward_popup(img)
+        check_clan_chat_drawer_a14(img, use_build_fallback=(attempt >= 2))
+        check_wrong_buttons_a14(img)
+
+        tap(*FAST_ATTACK["RETURN_HOME_BTN"], delay_range=(0.10, 0.18), jitter=3, check_pause=False)
+        double_click_storage_bars()
+        human_sleep(0.45, 0.05, apply_speed=True)
+
+    record_stat("stuck_recoveries", 1)
+    return is_on_home_page_a14()
+
+def click_gold_storage_3_times():
+    print(" [*] [HOME PAGE] Gold Storage Bar (2170, 63) par 3 baar click kar rahe hain...")
+    batch_tap_sequence([GOLD_STORAGE_BAR] * 3, inter_delay=0.04, jitter=2)
+
+def double_click_storage_bars():
+    global LAST_HOME_CLEANUP_TIME
+    batch_tap_sequence(
+        [GOLD_STORAGE_BAR, GOLD_STORAGE_BAR, ELIXIR_STORAGE_BAR, ELIXIR_STORAGE_BAR],
+        inter_delay=0.04,
+        jitter=2
+    )
+    LAST_HOME_CLEANUP_TIME = time.time()
+
+def perform_home_cleanup_once(max_age_sec=1.5):
+    global LAST_HOME_CLEANUP_TIME
+    if (time.time() - LAST_HOME_CLEANUP_TIME) <= max_age_sec:
+        return False
+    img = get_screenshot()
+    check_wrong_buttons_a14(img, check_clan_chat=True)
+    double_click_storage_bars()
+    LAST_HOME_CLEANUP_TIME = time.time()
+    return True
+
+def check_resources_full_for_upgrade(img=None):
+    if img is None:
+        img = get_screenshot()
+
+    def _scan_storage_bars(cur_img):
+        px_map = cur_img.load()
+        gx1, gy1, gx2, gy2 = GOLD_STORAGE_CHECK_BOX
+        gold_total, gold_colored = 0, 0
+        for y in range(gy1, gy2, 2):
+            for x in range(gx1, gx2, 2):
+                r, g, b = px_map[x, y]
+                if r > 215 and g > 215 and b > 215:
+                    continue
+                gold_total += 1
+                if r > 165 and g > 125 and b < 95 and (r + g) > (b * 3):
+                    gold_colored += 1
+        g_ratio = (gold_colored / gold_total) if gold_total > 0 else 0.0
+
+        ex1, ey1, ex2, ey2 = ELIXIR_STORAGE_CHECK_BOX
+        elixir_total, elixir_colored = 0, 0
+        for y in range(ey1, ey2, 2):
+            for x in range(ex1, ex2, 2):
+                r, g, b = px_map[x, y]
+                if r > 215 and g > 215 and b > 215:
+                    continue
+                elixir_total += 1
+                if r > 145 and b > 110 and r > (g + 25):
+                    elixir_colored += 1
+        e_ratio = (elixir_colored / elixir_total) if elixir_total > 0 else 0.0
+        return g_ratio, e_ratio
+
+    gold_ratio, elixir_ratio = _scan_storage_bars(img)
+
+    if gold_ratio < 0.05 and elixir_ratio < 0.05 and not is_on_home_page_a14(img):
+        print(" [!] [STORAGE ANTI-COVER GUARD] Storage bars hidden by overlay! Recovering Home Page & re-scanning...")
+        ensure_return_to_home_page_a14()
+        img = get_screenshot(force_fresh=True)
+        gold_ratio, elixir_ratio = _scan_storage_bars(img)
+
+    is_gold_full = gold_ratio >= 0.45
+    is_elixir_full = elixir_ratio >= 0.45
+    print(f" [i] [STORAGE SCAN] Gold Yellow: {gold_ratio*100:.0f}% (Full={is_gold_full}) | Elixir Pink: {elixir_ratio*100:.0f}% (Full={is_elixir_full})")
+    return is_gold_full or is_elixir_full
+
+def check_wall_resources_full_a14(img=None):
+    return check_resources_full_for_upgrade(img=img)
+
+# ==========================================
+# 6. BUILDER CHECK BOX READER & SINGLE/MULTI WALL MATCHERS
+# ==========================================
+def parse_builder_fraction(raw_text):
+    if not raw_text:
+        return None
+    s = raw_text.strip().replace(" ", "")
+    s = re.sub(r'^[|Il!i](?=/\d)', '1', s)
+    s = re.sub(r'(?<=\d)[|Il!i](?=[56789]\b|10\b)', '/', s)
+
+    if '/' in s:
+        parts = s.split('/', 1)
+        left = parts[0].strip()
+        left = re.sub(r'[|Il!i]', '1', left)
+        if not left:
+            return None
+        digits = re.sub(r'[^0-9]', '', left)
+        if digits:
+            if digits.endswith("10"):
+                return 10
+            val = int(digits[-1])
+            if 0 <= val <= 10:
+                return val
+        return None
+
+    digits_only = re.sub(r'[^0-9]', '', s)
+    if len(digits_only) == 3 and digits_only[1] in ['1', '7'] and digits_only[2] in ['5', '6', '7', '8', '9']:
+        return int(digits_only[0])
+    if len(digits_only) == 2 and digits_only[1] in ['5', '6', '7', '8', '9']:
+        return int(digits_only[0])
+    return None
+
+def read_builder_check_box_a14(img=None):
+    global LAST_DETECTED_BUILDERS, LAST_BUILDER_CHECK_TIME
+    if img is None:
+        img = get_screenshot()
+    x1, y1, x2, y2 = UPGRADE_A14["BUILDER_CHECK_BOX"]
+    w = x2 - x1
+    crop = img.crop((x1 - 2, y1 - 2, x2 + 2, y2 + 2))
+    large = crop.resize((crop.width * 3, crop.height * 3), Image.Resampling.LANCZOS).convert('L')
+    cfg = '--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789/|Il!'
+
+    for thresh in [180, 168, 192]:
+        bw = large.point(lambda p: 0 if p > thresh else 255, '1').convert('L')
+        padded = ImageOps.expand(bw, border=14, fill=255)
+        txt = pytesseract.image_to_string(padded, config=cfg).strip()
+        val = parse_builder_fraction(txt)
+        if val is not None:
+            print(f" [i] [BUILDER OCR] Box (1754,1008..1847,1038) Read: '{txt}' -> {val} Builders Free")
+            LAST_DETECTED_BUILDERS = val
+            LAST_BUILDER_CHECK_TIME = time.time()
+            return val
+
+    left_crop = img.crop((x1 - 2, y1, x1 + int(w * 0.44), y2))
+    l_large = left_crop.resize((left_crop.width * 3, left_crop.height * 3), Image.Resampling.LANCZOS).convert('L')
+    l_bw = ImageOps.expand(l_large.point(lambda p: 0 if p > 175 else 255, '1').convert('L'), border=14, fill=255)
+    l_txt = pytesseract.image_to_string(
+        l_bw,
+        config='--oem 3 --psm 10 -c tessedit_char_whitelist=0123456789|Il!'
+    ).strip()
+    if l_txt in ['|', 'I', 'l', '!']:
+        print(f" [i] [BUILDER LEFT-OCR] Read '{l_txt}' -> 1 Builder Free")
+        LAST_DETECTED_BUILDERS = 1
+        LAST_BUILDER_CHECK_TIME = time.time()
+        return 1
+    clean_d = re.sub(r'[^0-9]', '', l_txt)
+    if clean_d:
+        val = 10 if clean_d.startswith("10") else int(clean_d[0])
+        print(f" [i] [BUILDER LEFT-OCR] Read '{l_txt}' -> {val} Builders Free")
+        LAST_DETECTED_BUILDERS = val
+        LAST_BUILDER_CHECK_TIME = time.time()
+        return val
+
+    LAST_DETECTED_BUILDERS = 0
+    LAST_BUILDER_CHECK_TIME = time.time()
+    return 0
+
+def is_text_matching_wall(raw_text):
+    """
+    Enhanced Single-Wall & Multi-Wall Matcher:
+    Detects both 'Wall x125' AND standalone single 'Wall' (including minor OCR variations
+    like 'Wal', 'Wa1l', 'Wll', 'Wail', 'Wali', 'Vvall') while rejecting Wizard/Workshop/Warden.
+    """
+    if not raw_text:
+        return False
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', raw_text).lower()
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    if not cleaned:
+        return False
+
+    non_wall_w_words = ["wizard", "workshop", "warden", "watch", "witch", "weap", "war"]
+    if any(nw in cleaned for nw in non_wall_w_words):
+        return False
+
+    first_token = cleaned.split()[0]
+    wall_regexes = [
+        r'^wall',
+        r'^wa[l1i!|]{1,3}$',
+        r'^w[a4o][l1i!|]{1,3}$',
+        r'^vv?a[l1i!|]{1,2}$',
+        r'^w[l1i!|]{2,3}$',
+        r'\bwall\b',
+        r'\bwalls\b',
+        r'\bwali\b',
+        r'\bwail\b',
+        r'\bwa11\b',
+        r'\bwal1\b',
+        r'\bwa1l\b',
+        r'\bwal\b'
+    ]
+    return any(re.search(pat, first_token) or re.search(pat, cleaned) for pat in wall_regexes)
+
+def verify_wall_name_box_a14(img=None):
+    return True, "Wall"
+
+def classify_building_name_a14(raw_ocr_text):
+    if not raw_ocr_text:
+        return "UNKNOWN", ""
+    cleaned = re.sub(r'[^a-zA-Z0-9\s\-]', '', raw_ocr_text)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    base_name = re.sub(r'\b[xX]\s*\d+.*$', '', cleaned).strip()
+    if not base_name:
+        base_name = cleaned
+    lower = base_name.lower().strip()
+    if len(lower) < 2:
+        return "UNKNOWN", base_name
+    if is_text_matching_wall(lower) or is_text_matching_wall(cleaned):
+        return "WALL", "Wall"
+    for ex in CONDITION_1_EXCLUDED:
+        if ex in lower:
+            if ex == "archer" and "tower" in lower:
+                continue
+            return "EXCLUDED", base_name
+    for known in KNOWN_BUILDINGS:
+        if known in lower:
+            return "BUILDING", known.title()
+    alpha_only = re.sub(r'[^a-zA-Z]', '', lower)
+    if len(alpha_only) >= 3:
+        return "BUILDING", base_name
+    return "UNKNOWN", base_name
+EOF
+echo "✔ Bot v8 - Part 1/5 (bot_tools.py) Complete & Updated!"
